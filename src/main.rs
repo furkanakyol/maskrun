@@ -20,7 +20,7 @@ use keyring::{Backend, FieldUpdate, MetaUpdate, SecretMeta};
 #[derive(Parser)]
 #[command(
     name = "maskrun",
-    version,
+    version = env!("MASKRUN_VERSION"),
     about = "Run commands with secrets from your OS keyring, without leaking them into an AI agent's context.",
     after_help = "examples:\n  \
         maskrun put myapp-database-url        store a secret (prompts, not echoed)\n  \
