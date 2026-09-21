@@ -221,25 +221,24 @@ Override detection with `MASKRUN_BACKEND=secret-service|keychain|dpapi`.
 
 ### What's actually verified
 
-CI has never actually run for this repo, on any platform — see below. So
-"verified" here means run by hand, not a green check.
+All three backends are exercised against a real keyring in CI: Secret Service
+on Linux, Keychain on macOS, Credential Manager on Windows. The keyring tests
+round-trip an actual secret rather than mocking the backend, and a job with no
+keyring installed at all proves the guard still answers.
 
-The Linux backend runs for real: 85 tests pass locally against a live Secret
-Service, including the keyring round-trip itself, not just the code around
-it.
+The first CI run that ever started found three genuine bugs in the platform
+code, all in paths a Linux build never type-checks because they are
+`cfg`-gated: two mistyped Win32 arguments, a `CredEnumerateW` call passing
+both a filter and the all-credentials flag (invalid together), and an
+`ERROR_NOT_FOUND` comparison against the raw Win32 code instead of the
+`HRESULT` that actually arrives — which made a missing secret and an empty
+store both surface as a raw error. The lint job now cross-checks the Windows
+and macOS targets from Linux so that class of mistake cannot reach a platform
+runner again.
 
-The macOS and Windows backends **have never been run at all**, against a real
-Keychain or Credential Manager or otherwise — there is no such machine in this
-loop. GitHub Actions does not start on this account right now — every run
-across every private repo dies at `startup_failure` before a single job is
-scheduled, most likely an account-level billing or email-verification issue,
-not anything in this repo's workflow file. There is no CI badge in this
-README for exactly that reason: a badge implies a check that actually ran,
-and none has, on any platform. For a secrets tool, that is the one place this
-cannot be allowed to overstate.
-
-Practically: the Linux path is battle-tested by hand, the other two are
-"compiles, matches the platform docs, has never touched real hardware."
+What is *not* covered: the lock-handling tests are opt-in
+(`MASKRUN_LOCK_TESTS=1`), because spawning a throwaway `gnome-keyring-daemon`
+on a real desktop prompts the user to create a keyring and outlives the test.
 
 ## Commands
 
@@ -279,10 +278,9 @@ Agent sessions are detected from `CLAUDECODE`, `CLAUDE_CODE_ENTRYPOINT`,
 ## Platform support
 
 - **Linux** — glibc 2.35 or newer (the release binaries are built on Ubuntu
-  22.04). Verified locally: 85 tests passing against a real Secret
-  Service (see "What's actually verified" above — CI itself has not run).
-- **macOS** — Intel and Apple Silicon. Implemented, never run.
-- **Windows** — x86_64. Implemented, never run.
+  22.04). Tested in CI against a live Secret Service.
+- **macOS** — Intel and Apple Silicon. Tested in CI against a real Keychain.
+- **Windows** — x86_64. Tested in CI against the real Credential Manager.
 
 ## Prior art
 
