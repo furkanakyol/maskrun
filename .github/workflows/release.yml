@@ -1,0 +1,110 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ubuntu-22.04, not -latest: pins the glibc these binaries link
+          # against to 2.35 (Ubuntu 22.04's) instead of whatever -latest
+          # rotates to next, since older glibc is the more compatible choice
+          # for a binary other people's machines will run unmodified.
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+          # cross, not a plain cargo cross-build: dbus-secret-service links
+          # libdbus via pkg-config, and this x86_64 runner has no aarch64
+          # libdbus-1-dev to link against on its own. cross's docker image
+          # carries an aarch64 sysroot with it. (musl was considered instead
+          # of gnu for static linking, but musl has no libdbus at all — hence
+          # gnu targets only for Linux.)
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04
+            cross: true
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross
+        if: matrix.cross
+        run: cargo install cross --locked
+
+      - name: Build
+        if: ${{ !matrix.cross }}
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Build (cross)
+        if: matrix.cross
+        run: cross build --release --target ${{ matrix.target }}
+
+      # No subdirectory inside the archive, binary named plain `maskrun`
+      # (`maskrun.exe` on Windows): install.sh/install.ps1 unpack straight
+      # into their install directory and expect the binary to already have
+      # its final name at the archive root.
+      - name: Package (unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -eu
+          version="${GITHUB_REF_NAME#v}"
+          name="maskrun-${version}-${{ matrix.target }}"
+          stage="dist/stage"
+          mkdir -p "$stage" dist
+          cp "target/${{ matrix.target }}/release/maskrun" "$stage/maskrun"
+          tar -C "$stage" -czf "dist/${name}.tar.gz" maskrun
+          rm -rf "$stage"
+
+      - name: Package (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $version = $env:GITHUB_REF_NAME -replace '^v', ''
+          $name = "maskrun-$version-${{ matrix.target }}"
+          $stage = "dist/stage"
+          New-Item -ItemType Directory -Force -Path $stage, "dist" | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/maskrun.exe" "$stage/maskrun.exe"
+          Compress-Archive -Path "$stage/maskrun.exe" -DestinationPath "dist/$name.zip"
+          Remove-Item -Recurse -Force $stage
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: archive-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: archive-*
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum * > SHA256SUMS
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          fail_on_unmatched_files: true

@@ -1,3 +1,4 @@
+#[cfg(target_os = "linux")]
 use std::collections::HashMap;
 
 use crate::error::{Error, Result};
@@ -111,7 +112,16 @@ pub mod linux {
             // would need a DH key exchange, pulling in a num-bigint-based
             // stack (~30 extra transitive crates) to harden a channel the OS
             // already restricts to this user.
-            let ss = SecretService::connect(EncryptionType::Plain).map_err(|e| {
+            //
+            // A bounded prompt timeout, not the crate's plain connect(): that
+            // blocks *indefinitely* on an unlock prompt nobody may be there
+            // to answer (headless CI, SSH) — its own way of reproducing the
+            // incident this file exists to fix.
+            let ss = SecretService::connect_with_max_prompt_timeout(
+                EncryptionType::Plain,
+                Self::prompt_timeout_secs(),
+            )
+            .map_err(|e| {
                 Error::msg(format!(
                     "could not reach the Secret Service ({e}). A running secret \
                      service (gnome-keyring or KeePassXC) is required."
@@ -120,8 +130,52 @@ pub mod linux {
             Ok(Self { ss })
         }
 
+        // 0 = cancel an unlock prompt instead of ever showing it (the
+        // crate's own documented behaviour): the explicit opt-out, or no
+        // DISPLAY/WAYLAND_DISPLAY for the graphical prompt to render on in
+        // the first place. 30s otherwise — enough to type a password,
+        // short enough not to leave `run`/`get`/`list` hanging for good.
+        fn prompt_timeout_secs() -> u64 {
+            if std::env::var("MASKRUN_NO_UNLOCK").as_deref() == Ok("1") {
+                return 0;
+            }
+            let has_display = std::env::var_os("DISPLAY").is_some()
+                || std::env::var_os("WAYLAND_DISPLAY").is_some();
+            if has_display {
+                30
+            } else {
+                0
+            }
+        }
+
         fn search_attrs(secret: &str) -> HashMap<&str, &str> {
             HashMap::from([("service", SERVICE), ("name", secret)])
+        }
+
+        // Covers a dismissed prompt and one never shown (timeout 0) alike;
+        // never suggests `maskrun put` — the secrets are still there.
+        fn locked_error(e: dbus_secret_service::Error) -> Error {
+            match e {
+                dbus_secret_service::Error::Prompt => Error::msg(
+                    "the keyring is locked and maskrun did not unlock it (no unlock \
+                     prompt was completed). Your secrets are still there — unlock the \
+                     keyring yourself and run this again.",
+                ),
+                other => Error::msg(format!("secret-service: {other}")),
+            }
+        }
+
+        // A no-op when nothing's locked (ensure_unlocked() checks first),
+        // so calling this up front is cheap on the common path.
+        fn unlock_all_collections(&self) -> Result<()> {
+            let collections = self
+                .ss
+                .get_all_collections()
+                .map_err(|e| Error::msg(format!("secret-service: {e}")))?;
+            for collection in &collections {
+                collection.ensure_unlocked().map_err(Self::locked_error)?;
+            }
+            Ok(())
         }
     }
 
@@ -135,6 +189,10 @@ pub mod linux {
                 .ss
                 .get_any_collection()
                 .map_err(|e| Error::msg(format!("secret-service: {e}")))?;
+            // `put` is a direct write request, so unlocking to satisfy it
+            // (unlike the incidental get()/list() calls from status/run) is
+            // expected, not a surprise.
+            collection.ensure_unlocked().map_err(Self::locked_error)?;
             collection
                 .create_item(
                     &format!("maskrun: {secret}"),
@@ -148,6 +206,7 @@ pub mod linux {
         }
 
         fn get(&self, secret: &str) -> Result<Option<String>> {
+            self.unlock_all_collections()?;
             let found = self
                 .ss
                 .search_items(Self::search_attrs(secret))
@@ -156,9 +215,10 @@ pub mod linux {
                 Some(item) => item,
                 None => return Ok(None),
             };
+            // Belt and suspenders in case a provider still hands back a
+            // locked item despite the collection-wide unlock above.
             if item.is_locked().unwrap_or(false) {
-                item.unlock()
-                    .map_err(|e| Error::msg(format!("secret-service: {e}")))?;
+                item.unlock().map_err(Self::locked_error)?;
             }
             let bytes = item
                 .get_secret()
@@ -179,6 +239,7 @@ pub mod linux {
         }
 
         fn list(&self) -> Result<Vec<String>> {
+            self.unlock_all_collections()?;
             let found = self
                 .ss
                 .search_items(HashMap::from([("service", SERVICE)]))
@@ -218,10 +279,16 @@ pub mod linux {
 #[cfg(target_os = "macos")]
 pub mod macos {
     use super::*;
+    use security_framework::os::macos::keychain::SecKeychain;
     use security_framework::passwords::{
-        delete_generic_password, generic_password, set_generic_password,
+        delete_generic_password, generic_password, set_generic_password, PasswordOptions,
     };
     use std::process::Command;
+
+    // Apple's errSecItemNotFound (<Security/SecBase.h>); security-framework
+    // doesn't re-export it, and it's not worth a direct dep on
+    // security-framework-sys for one constant.
+    const ERR_SEC_ITEM_NOT_FOUND: i32 = -25300;
 
     pub struct KeychainBackend;
 
@@ -237,22 +304,43 @@ pub mod macos {
         }
     }
 
-    // Default is_locked() stands: security-framework surfaces a locked
-    // keychain as a get()/put() error, not a queryable property.
+    // No is_locked() override: security-framework wraps no lock probe, only
+    // unlock() — but SecKeychainUnlock is documented to no-op when already
+    // unlocked, so calling it unconditionally below is as cheap as a probe
+    // and a canceled prompt still surfaces as its own error instead of
+    // looking like an empty keychain. Its one gap vs. the Linux path: no
+    // timeout knob at all (a blocking FFI call), so MASKRUN_NO_UNLOCK is the
+    // only way to guarantee headless macOS CI doesn't hang on it.
+    fn unlock_default_keychain() -> Result<()> {
+        if std::env::var("MASKRUN_NO_UNLOCK").as_deref() == Ok("1") {
+            return Ok(());
+        }
+        let mut keychain =
+            SecKeychain::default().map_err(|e| Error::msg(format!("keychain: {e}")))?;
+        keychain.unlock(None).map_err(|e| {
+            Error::msg(format!(
+                "the keychain is locked and the unlock prompt was not completed ({e}). \
+                 Your secrets are still there — unlock it and try again."
+            ))
+        })
+    }
+
     impl Backend for KeychainBackend {
         fn name(&self) -> &'static str {
             "keychain"
         }
 
         fn put(&self, secret: &str, value: &str) -> Result<()> {
+            unlock_default_keychain()?;
             set_generic_password(SERVICE, secret, value.as_bytes())
                 .map_err(|e| Error::msg(format!("keychain: {e}")))
         }
 
         fn get(&self, secret: &str) -> Result<Option<String>> {
-            match generic_password(SERVICE, secret) {
+            unlock_default_keychain()?;
+            match generic_password(PasswordOptions::new_generic_password(SERVICE, secret)) {
                 Ok(bytes) => Ok(Some(String::from_utf8_lossy(&bytes).into_owned())),
-                Err(e) if e.code() == security_framework::base::errSecItemNotFound => Ok(None),
+                Err(e) if e.code() == ERR_SEC_ITEM_NOT_FOUND => Ok(None),
                 Err(e) => Err(Error::msg(format!("keychain: {e}"))),
             }
         }
@@ -260,12 +348,13 @@ pub mod macos {
         fn delete(&self, secret: &str) -> Result<()> {
             match delete_generic_password(SERVICE, secret) {
                 Ok(()) => Ok(()),
-                Err(e) if e.code() == security_framework::base::errSecItemNotFound => Ok(()),
+                Err(e) if e.code() == ERR_SEC_ITEM_NOT_FOUND => Ok(()),
                 Err(e) => Err(Error::msg(format!("keychain: {e}"))),
             }
         }
 
         fn list(&self) -> Result<Vec<String>> {
+            unlock_default_keychain()?;
             let output = Command::new("security")
                 .arg("dump-keychain")
                 .output()

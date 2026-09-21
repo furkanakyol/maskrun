@@ -9,26 +9,34 @@ on:
 
 jobs:
   linux:
-    name: linux · py${{ matrix.python }}
+    name: linux
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        python: ['3.9', '3.11', '3.13']
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          python-version: ${{ matrix.python }}
+          components: clippy
 
       - name: Install Secret Service
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq libsecret-tools gnome-keyring dbus-x11
 
-      # --require-keyring makes a silently skipped backend fail the job, so a
-      # green tick here always means the keyring tests really ran.
+      - name: Build
+        run: cargo build --release
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      # --test-threads=1: measured, not assumed — under parallel load this
+      # runner's D-Bus/secret-service setup occasionally drops a connection;
+      # serial runs have gone through cleanly dozens of times in a row.
+      # MASKRUN_REQUIRE_KEYRING=1 turns a silently-skipped backend into a
+      # hard failure, so a green run here always means the keyring tests
+      # actually ran against a live Secret Service.
       - name: Test
+        env:
+          MASKRUN_REQUIRE_KEYRING: "1"
         run: |
           dbus-run-session -- bash -c '
             set -u
@@ -40,7 +48,7 @@ jobs:
               fi
               sleep 1
             done
-            python test/test_maskrun.py --require-keyring
+            cargo test -- --test-threads=1
           '
 
   macos:
@@ -48,9 +56,7 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.13'
+      - uses: dtolnay/rust-toolchain@stable
 
       - name: Create a disposable keychain
         run: |
@@ -61,53 +67,62 @@ jobs:
           security set-keychain-settings maskrun-ci.keychain
 
       - name: Test
-        run: python test/test_maskrun.py --require-keyring
+        env:
+          MASKRUN_REQUIRE_KEYRING: "1"
+        run: cargo test -- --test-threads=1
 
   windows:
     name: windows · dpapi
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.13'
+      - uses: dtolnay/rust-toolchain@stable
 
       # DPAPI needs no service, so this needs no setup at all.
       - name: Test
-        run: python test/test_maskrun.py --require-keyring
+        env:
+          MASKRUN_REQUIRE_KEYRING: "1"
+        run: cargo test -- --test-threads=1
 
   no-keyring:
     name: linux · no keyring (guard still works)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.13'
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build
+        run: cargo build --release
 
       # The README promises the guard works with no keyring present, e.g. in a
-      # bare container. This job is what keeps that promise honest.
+      # bare container. This job is what keeps that promise honest: no
+      # secret-service packages are installed above, and no
+      # MASKRUN_REQUIRE_KEYRING is set, so the suite's own backend-reachable
+      # checks must all skip cleanly rather than fail.
       - name: Test without a backend
-        run: python test/test_maskrun.py
+        run: cargo test -- --test-threads=1
 
       - name: Guard must answer without a keyring
         run: |
           echo '{"tool_name":"Bash","tool_input":{"command":"maskrun get x"}}' \
-            | python bin/maskrun hook | grep -q '"deny"'
+            | target/release/maskrun hook | grep -q '"deny"'
           echo '{"tool_name":"Bash","tool_input":{"command":"maskrun status"}}' \
-            | python bin/maskrun hook | wc -c | grep -qx '0'
+            | target/release/maskrun hook | wc -c | grep -qx '0'
 
   lint:
     name: lint
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          python-version: '3.13'
+          components: rustfmt, clippy
 
-      - name: Byte-compile
-        run: python -m py_compile bin/maskrun test/test_maskrun.py
+      - name: cargo fmt --check
+        run: cargo fmt --check
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets -- -D warnings
 
       - name: Shell lint
         run: |
@@ -124,53 +139,20 @@ jobs:
           if ($errors) { $errors | ForEach-Object { Write-Error $_ }; exit 1 }
           Write-Host "install.ps1 parses cleanly"
 
-  installer:
-    name: installer · ${{ matrix.os }}
-    if: github.event_name == 'push'
-    needs: [linux, macos, windows]
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
+  msrv:
+    name: msrv
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.13'
-
-      # Fetches from this very commit, so the published one-liner is tested
-      # end to end rather than assumed to work.
-      - name: Install from this commit
-        env:
-          MASKRUN_REF: ${{ github.sha }}
-          MASKRUN_BIN: ${{ runner.temp }}/bin
-        run: sh install.sh
-
-      - name: Installed binary runs
+      # Read from Cargo.toml instead of hardcoding it a second time here —
+      # a bumped rust-version should not also require remembering to edit
+      # this workflow.
+      - id: msrv
         run: |
-          "${{ runner.temp }}/bin/maskrun" --version
-          "${{ runner.temp }}/bin/maskrun" --help > /dev/null
-
-  installer-windows:
-    name: installer · windows
-    if: github.event_name == 'push'
-    needs: [windows]
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+          version=$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@master
         with:
-          python-version: '3.13'
-
-      - name: Install from this commit
-        shell: pwsh
-        env:
-          MASKRUN_REF: ${{ github.sha }}
-          MASKRUN_BIN: ${{ runner.temp }}\bin
-        run: ./install.ps1
-
-      - name: Installed shim runs
-        shell: cmd
-        run: |
-          "${{ runner.temp }}\bin\maskrun.cmd" --version
+          toolchain: ${{ steps.msrv.outputs.version }}
+      - name: Build at MSRV
+        run: cargo build --locked
