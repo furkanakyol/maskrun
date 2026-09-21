@@ -160,6 +160,28 @@ that receives the tool call as JSON on stdin — see
 The CLI enforces the same refusals itself, so an agent running in a harness
 with no hook support still cannot `maskrun get`.
 
+### Guiding an agent that has no hook mechanism
+
+```bash
+maskrun install-rules        # writes a short block into AGENTS.md/CLAUDE.md/.cursor rules
+```
+
+`install-guard` only works where the harness runs a PreToolUse hook for you.
+Elsewhere, there is nothing enforcing anything — so `install-rules` writes a
+short, marked block into whichever of `AGENTS.md`, `CLAUDE.md` or
+`.cursor/rules/` already exist in the project (creating `AGENTS.md` if none
+do), telling the agent how to use maskrun here. **This is guidance, not
+enforcement**: a model can still ignore it, the way it can ignore any other
+instruction. It is a fallback for harnesses `install-guard` cannot reach, not
+a substitute for it.
+
+The block is bounded by `<!-- maskrun:start -->`/`<!-- maskrun:end -->`
+markers, backs up the file first, is idempotent (a second run updates it in
+place instead of duplicating it), and `--remove` takes it back out without
+touching the rest of the file. With a `.maskrun` manifest present, the block
+lists the actual variable names the project expects; `--file <path>` targets
+one file directly, skipping discovery.
+
 ### The interactive view
 
 ```bash
@@ -348,6 +370,7 @@ maskrun import <.env> [--dry-run]     move a .env into the keyring
 maskrun completions <fish|bash|zsh>   print a shell completion script
 maskrun install-guard [--remove]      register the agent guard
 maskrun hook                          the guard itself (reads JSON on stdin)
+maskrun install-rules [--remove]      tell agents how to use maskrun here (guidance, not enforcement)
 ```
 
 `import` skips `VITE_`, `NEXT_PUBLIC_`, `PUBLIC_`, `REACT_APP_`, `NUXT_PUBLIC_`,

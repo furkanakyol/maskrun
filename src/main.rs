@@ -2,6 +2,7 @@ mod agent;
 mod error;
 mod guard;
 mod install_guard;
+mod install_rules;
 mod keyring;
 mod manifest;
 mod mask;
@@ -32,7 +33,8 @@ use keyring::{Backend, FieldUpdate, MetaUpdate, SecretMeta};
         maskrun exec API_KEY=my-key -- curl https://api.example.com\n  \
         maskrun list                          grouped by platform, never values\n  \
         maskrun list --plain                  flat names only, one per line, for scripts\n  \
-        maskrun completions fish > ~/.config/fish/completions/maskrun.fish\n\n\
+        maskrun completions fish > ~/.config/fish/completions/maskrun.fish\n\
+        maskrun install-rules                 tell agents how to use maskrun here\n\n\
         Output masking is automatic in an AI agent session and whenever stdout is not a\n\
         terminal. --raw turns it off, --mask forces it on."
 )]
@@ -137,6 +139,18 @@ enum Command {
         )]
         command_path: Option<String>,
     },
+    #[command(
+        about = "add maskrun usage guidance to the project's agent instructions \
+                 (AGENTS.md/CLAUDE.md/.cursor/rules)"
+    )]
+    InstallRules {
+        #[arg(long, help = "uninstall instead")]
+        remove: bool,
+        #[arg(long = "file", help = "write to this file only, skip discovery")]
+        file: Option<String>,
+        #[arg(long = "dry-run", help = "print, write nothing")]
+        dry_run: bool,
+    },
 }
 
 fn split_leading_command(argv: Vec<String>) -> Vec<String> {
@@ -224,7 +238,10 @@ fn dispatch(cmd: Command, tail: Vec<String>) -> Result<i32> {
     require_name_before_backend(&cmd)?;
 
     let backend: Option<Box<dyn Backend>> = match &cmd {
-        Command::Hook | Command::InstallGuard { .. } | Command::Completions { .. } => None,
+        Command::Hook
+        | Command::InstallGuard { .. }
+        | Command::InstallRules { .. }
+        | Command::Completions { .. } => None,
         _ => Some(keyring::pick_backend()?),
     };
 
@@ -291,6 +308,15 @@ fn dispatch(cmd: Command, tail: Vec<String>) -> Result<i32> {
             dry_run,
             config: config.as_deref(),
             command_path: command_path.as_deref(),
+        }),
+        Command::InstallRules {
+            remove,
+            file,
+            dry_run,
+        } => install_rules::cmd_install_rules(install_rules::InstallRulesArgs {
+            remove,
+            dry_run,
+            file: file.as_deref(),
         }),
     }
 }
