@@ -18,6 +18,18 @@ base64 = "0.23"
 percent-encoding = "2"
 zeroize = "1"
 rpassword = "7"
+# Raw mode, key events, alternate screen and ANSI colour for the bare-`maskrun`
+# TUI. Not `ratatui`: a two-pane list/detail view needs none of its layout
+# engine, and every extra crate here is one more thing to read in a tool whose
+# whole job is handling secrets.
+crossterm = "0.28"
+# `default-features = false` drops the `image-data` feature (png/tiff/jpeg
+# decoders this tool never needs for clipboard text). `wayland-data-control`
+# talks the Wayland clipboard protocol directly instead of falling back to
+# XWayland-only X11 support, matching why arboard was chosen over shelling out
+# to `wl-copy`/`xclip` in the first place — see keyring.rs's precedent for
+# picking a direct-protocol crate over a CLI dependency.
+arboard = { version = "3", default-features = false, features = ["wayland-data-control"] }
 
 # Not `keyring`: its Secret Service store uses service+username, not
 # service+name (see keyring.rs). Plain, not Dh, skips a ~30-crate DH stack.

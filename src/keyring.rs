@@ -142,6 +142,11 @@ pub fn pick_backend() -> Result<Box<dyn Backend>> {
             "secret-service" => secret_service_backend(),
             "keychain" => keychain_backend(),
             "dpapi" => credential_manager_backend(),
+            // Test-only, undocumented on purpose (see the `memory` module):
+            // reachable only by setting *both* this and MASKRUN_STORE_DIR —
+            // no cfg(target_os) branch or default ever selects it, so a real
+            // interactive session never touches it by accident.
+            "memory" => memory_backend(),
             other => Err(Error::msg(format!(
                 "unknown MASKRUN_BACKEND='{other}' (expected secret-service, keychain \
                  or dpapi)"
@@ -189,6 +194,199 @@ fn credential_manager_backend() -> Result<Box<dyn Backend>> {
     Err(Error::msg(
         "the dpapi/credential-manager backend is only available on Windows",
     ))
+}
+
+// No cfg gate — this one has to build and run on every platform's `cargo
+// test`/pty harness alike, unlike the three above.
+fn memory_backend() -> Result<Box<dyn Backend>> {
+    let dir = std::env::var("MASKRUN_STORE_DIR").map_err(|_| {
+        Error::msg(
+            "MASKRUN_BACKEND=memory requires MASKRUN_STORE_DIR=<directory>. This backend \
+             exists only so interactive tests never run against a real keyring — there is \
+             deliberately no default location for it to fall back to.",
+        )
+    })?;
+    Ok(Box::new(memory::MemoryBackend::new(dir.into())))
+}
+
+// A JSON-file-backed `Backend` that never touches a real OS keyring —
+// written after a TUI pty test navigated into the wrong platform group and
+// deleted two real secrets from the actual Secret Service (see
+// Sessions/2026-09-21-tui.md). "Don't touch real secrets" was a note in a
+// brief, not something the test process was structurally prevented from
+// doing; this module is the fix. Reached only through `memory_backend()`
+// above, itself reached only by the explicit `MASKRUN_BACKEND=memory`
+// string — no cfg(target_os) branch, and no default in `pick_backend`,
+// ever selects it. File-backed rather than purely in-process so a setup
+// step (`maskrun put` in one process) and a driven TUI (a second process,
+// as a real pty test spawns one) can share the same throwaway store via
+// one `MASKRUN_STORE_DIR`, the same way tests/cli.rs already spawns the
+// compiled binary fresh per assertion.
+mod memory {
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    use serde::{Deserialize, Serialize};
+
+    use super::{Backend, Error, MetaUpdate, Result, SecretMeta};
+
+    #[derive(Clone, Default, Serialize, Deserialize)]
+    struct Entry {
+        value: String,
+        platform: Option<String>,
+        note: Option<String>,
+    }
+
+    impl Entry {
+        fn meta(&self) -> SecretMeta {
+            SecretMeta {
+                platform: self.platform.clone(),
+                note: self.note.clone(),
+            }
+        }
+    }
+
+    pub struct MemoryBackend {
+        path: PathBuf,
+    }
+
+    impl MemoryBackend {
+        pub fn new(dir: PathBuf) -> Self {
+            MemoryBackend {
+                path: dir.join("maskrun-test-store.json"),
+            }
+        }
+
+        // Missing or unreadable file reads as an empty store rather than an
+        // error: the first `put` against a fresh MASKRUN_STORE_DIR has
+        // nothing to load yet, same as a fresh real keyring has nothing to
+        // list.
+        fn load(&self) -> HashMap<String, Entry> {
+            std::fs::read(&self.path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+                .unwrap_or_default()
+        }
+
+        fn save(&self, store: &HashMap<String, Entry>) -> Result<()> {
+            if let Some(parent) = self.path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let bytes = serde_json::to_vec_pretty(store)?;
+            std::fs::write(&self.path, bytes)?;
+            Ok(())
+        }
+    }
+
+    impl Backend for MemoryBackend {
+        fn name(&self) -> &'static str {
+            "memory (test-only)"
+        }
+
+        fn put(&self, secret: &str, value: &str, update: &MetaUpdate) -> Result<()> {
+            let mut store = self.load();
+            let merged = store
+                .get(secret)
+                .map(Entry::meta)
+                .unwrap_or_default()
+                .merge(update);
+            store.insert(
+                secret.to_string(),
+                Entry {
+                    value: value.to_string(),
+                    platform: merged.platform,
+                    note: merged.note,
+                },
+            );
+            self.save(&store)
+        }
+
+        fn get(&self, secret: &str) -> Result<Option<String>> {
+            Ok(self.load().get(secret).map(|e| e.value.clone()))
+        }
+
+        fn get_meta(&self, secret: &str) -> Result<SecretMeta> {
+            Ok(self.load().get(secret).map(Entry::meta).unwrap_or_default())
+        }
+
+        fn set_meta(&self, secret: &str, update: &MetaUpdate) -> Result<()> {
+            let mut store = self.load();
+            let Some(existing) = store.get(secret).cloned() else {
+                return Err(Error::msg(format!("no such secret: {secret}")));
+            };
+            let merged = existing.meta().merge(update);
+            store.insert(
+                secret.to_string(),
+                Entry {
+                    value: existing.value,
+                    platform: merged.platform,
+                    note: merged.note,
+                },
+            );
+            self.save(&store)
+        }
+
+        fn delete(&self, secret: &str) -> Result<()> {
+            let mut store = self.load();
+            store.remove(secret);
+            self.save(&store)
+        }
+
+        fn list(&self) -> Result<Vec<String>> {
+            let mut names: Vec<String> = self.load().into_keys().collect();
+            names.sort();
+            Ok(names)
+        }
+
+        fn list_meta(&self) -> Result<Vec<(String, SecretMeta)>> {
+            let mut out: Vec<(String, SecretMeta)> = self
+                .load()
+                .into_iter()
+                .map(|(name, entry)| (name, entry.meta()))
+                .collect();
+            out.sort_by(|a, b| a.0.cmp(&b.0));
+            Ok(out)
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn put_get_delete_roundtrip_through_the_file() {
+            let dir = tempfile::tempdir().unwrap();
+            let backend = MemoryBackend::new(dir.path().to_path_buf());
+            let update = MetaUpdate {
+                platform: crate::keyring::FieldUpdate::Set("github".into()),
+                note: crate::keyring::FieldUpdate::Keep,
+            };
+            backend.put("s1", "v1", &update).unwrap();
+            assert_eq!(backend.get("s1").unwrap().as_deref(), Some("v1"));
+            assert_eq!(
+                backend.get_meta("s1").unwrap().platform.as_deref(),
+                Some("github")
+            );
+            backend.delete("s1").unwrap();
+            assert_eq!(backend.get("s1").unwrap(), None);
+        }
+
+        #[test]
+        fn a_second_backend_instance_over_the_same_dir_sees_the_same_data() {
+            let dir = tempfile::tempdir().unwrap();
+            let a = MemoryBackend::new(dir.path().to_path_buf());
+            a.put("s1", "v1", &MetaUpdate::default()).unwrap();
+            let b = MemoryBackend::new(dir.path().to_path_buf());
+            assert_eq!(b.get("s1").unwrap().as_deref(), Some("v1"));
+        }
+
+        #[test]
+        fn missing_store_file_reads_as_empty_not_an_error() {
+            let dir = tempfile::tempdir().unwrap();
+            let backend = MemoryBackend::new(dir.path().to_path_buf());
+            assert_eq!(backend.list().unwrap(), Vec::<String>::new());
+        }
+    }
 }
 
 // Not the `keyring` crate: its default (v1/zbus) Secret Service store sets

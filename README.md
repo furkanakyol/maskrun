@@ -160,6 +160,70 @@ that receives the tool call as JSON on stdin — see
 The CLI enforces the same refusals itself, so an agent running in a harness
 with no hook support still cannot `maskrun get`.
 
+### The interactive view
+
+```bash
+maskrun            # in your own terminal, no arguments
+```
+
+A real terminal with nothing else on the command line opens an arrow-key
+view: platforms on the left, that platform's secrets and the highlighted
+one's detail (platform, note, value) on the right.
+
+```
+↑↓ move   → enter   ← back   e edit   d delete   v reveal   y copy   q quit
+```
+
+Values are masked (`••••••••••••••••`) until you press `v`, and a value is
+only ever read from the keyring at that moment — moving through the list
+never touches it. Moving to a different secret re-masks automatically. `e`
+edits the platform, note and value in place (blank keeps the current one);
+`d` asks for confirmation by name (`delete 'name'? [y/N]`) and only a literal
+`y`/`Y` proceeds — every other key, including Enter, cancels. `y` copies the
+value to your clipboard.
+
+It runs on an [alternate screen
+buffer](https://en.wikipedia.org/wiki/Terminal_emulator#Alternate_screen_buffer):
+nothing it draws — including a revealed value — ever lands in your terminal's
+scrollback, unlike `maskrun get`'s output today. This is a genuine
+improvement independent of anything else below.
+
+Like every other value-touching path, it **never opens in an AI agent
+session** — piped output or not, a detected agent session always gets the
+same names-only summary a bare `maskrun` prints non-interactively. It also
+declines on a terminal smaller than 60x15, and tells you why before falling
+back to that summary.
+
+#### Clipboard copy
+
+`y` copies the current secret to your clipboard, since revealing a value
+you can't then paste anywhere just moves the problem — you'd retype it or
+select it with the mouse instead, both worse. Three built-in limits:
+
+- **Auto-clears after 45 seconds.** The TUI shows a live countdown once
+  something is copied; `c` clears it immediately instead of waiting, and
+  quitting the TUI with anything still copied clears it too. Clearing
+  restores whatever was on the clipboard before the copy, or empties it if
+  there was nothing.
+- **A do-not-record hint goes out on every platform**, via arboard's
+  `exclude_from_history`: KDE's `x-kde-passwordManagerHint` mime type on
+  Linux, the community `org.nspasteboard.ConcealedType` convention on macOS,
+  and the native `CanIncludeInClipboardHistory` clipboard format on Windows.
+  Verified against a real Klipper here: a plain copy shows up in its
+  history, a tagged one does not, and Klipper doesn't even report the
+  tagged one as the *current* clipboard contents. Each is a hint a specific
+  tool chooses to honour, not something maskrun enforces — see below.
+- It **never opens in an agent session**, same gate as the rest of the TUI.
+
+**What this doesn't fix:** any clipboard-history tool that isn't looking for
+that hint (GNOME's, most non-KDE Wayland setups, and — observed directly
+while building this — even KDE's own Klipper when it isn't watching the
+clipboard transport your compositor happens to use) still records the value
+permanently, and the 45-second auto-clear does nothing to that copy once
+it's in a history file. Treat clipboard copy the same as `/proc/<pid>/environ`
+and a human pasting an unmasked value by hand, below: a real limit, not a
+solved problem.
+
 ## What this is not
 
 **maskrun is not a security boundary.** It is hardening against accidents, and
@@ -177,6 +241,15 @@ it should not be sold to you — or by you — as anything more.
 - **Process environment.** While `maskrun run` is running, its child's
   environment is readable via `/proc/<pid>/environ`. The guard blocks that path
   directly, but env injection has this shape by design.
+- **Clipboard copy (`y` in the interactive view) is not undone by auto-clear.**
+  The 45-second timeout empties *the clipboard*; it does nothing to a
+  clipboard-history tool that already recorded the value permanently before
+  that timeout fired. maskrun tags the copy so KDE's Klipper skips it — real
+  and verified, not every history-keeping tool honours that tag, and GNOME's
+  clipboard history, most non-KDE Wayland setups, and Windows Clipboard
+  History are not known to. Same shelf as `/proc/<pid>/environ` above and a
+  human pasting an unmasked value by hand below: a limit stated plainly, not
+  quietly solved.
 - **`ps` during a write — closed.** On macOS, the value used to reach `security`
   as a CLI argument, briefly visible in the process list via `ps`. That path is
   gone: maskrun now calls Security.framework's generic-password API directly,
@@ -313,9 +386,11 @@ stored unmasked, are visible to an AI agent session, and are shown by `list`
 and `status`. Do not put a secret value in `--note`; it is capped at 200
 characters and may not contain a newline.
 
-`maskrun` with no arguments (or piped, e.g. `maskrun | cat`) prints a short
-overview instead: the manifest status and the grouped secret list above, so
-you don't have to hold the command surface in your head.
+`maskrun` with no arguments opens [the interactive view](#the-interactive-view)
+in a real terminal; piped (`maskrun | cat`), non-interactive, or in an agent
+session, it prints a short overview instead: the manifest status and the
+grouped secret list above, so you don't have to hold the command surface in
+your head.
 
 ### Shell completion
 

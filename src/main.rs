@@ -6,6 +6,7 @@ mod keyring;
 mod manifest;
 mod mask;
 mod run;
+mod tui;
 
 use std::io::{IsTerminal, Read, Write};
 use std::process::ExitCode;
@@ -190,7 +191,38 @@ fn exit_code(result: Result<i32>) -> i32 {
     }
 }
 
+// Mirrors the exact "no name, can't prompt" condition each of
+// cmd_put/cmd_label/cmd_rm_interactive (via choose_secret) already checks
+// internally — duplicated here only so dispatch() can fail before handing
+// control to a function that receives an already-constructed backend.
+fn require_name_before_backend(cmd: &Command) -> Result<()> {
+    match cmd {
+        Command::Put {
+            name: None, stdin, ..
+        } if *stdin || !interactive_stdio() => Err(Error::msg(
+            "secret name required. Usage: maskrun put <name>",
+        )),
+        Command::Label { name: None, .. } if !interactive_stdio() => Err(Error::msg(
+            "secret name required. Usage: maskrun label <name> [--for X] [--note Y]",
+        )),
+        Command::Rm { name: None } if !interactive_stdio() => {
+            Err(Error::msg("secret name required. Usage: maskrun rm <name>"))
+        }
+        _ => Ok(()),
+    }
+}
+
 fn dispatch(cmd: Command, tail: Vec<String>) -> Result<i32> {
+    // A missing required name with no tty to prompt on is a usage error,
+    // not a keyring problem — it must be reported as one even when the
+    // keyring is unreachable. Checked before `pick_backend()` below, not
+    // inside cmd_put/cmd_label/cmd_rm_interactive, precisely so this
+    // never gets as far as asking the keyring anything (see the "linux ·
+    // no keyring" CI job, where the old order reported "could not reach
+    // the Secret Service" for what was actually just `maskrun put` typed
+    // with no name in a script).
+    require_name_before_backend(&cmd)?;
+
     let backend: Option<Box<dyn Backend>> = match &cmd {
         Command::Hook | Command::InstallGuard { .. } | Command::Completions { .. } => None,
         _ => Some(keyring::pick_backend()?),
@@ -270,7 +302,7 @@ fn interactive_stdio() -> bool {
     std::io::stdin().is_terminal() && std::io::stdout().is_terminal() && !agent::in_agent()
 }
 
-fn prompt_line(prompt: &str) -> Result<Option<String>> {
+pub(crate) fn prompt_line(prompt: &str) -> Result<Option<String>> {
     print!("{prompt}");
     std::io::stdout().flush().ok();
     let mut line = String::new();
@@ -285,7 +317,7 @@ fn prompt_line(prompt: &str) -> Result<Option<String>> {
 
 // Shared by --for on `put`/`label` and by the interactive platform prompt:
 // absent -> leave alone, "" -> clear, anything else -> validate and set.
-fn platform_update(raw: Option<String>) -> Result<FieldUpdate> {
+pub(crate) fn platform_update(raw: Option<String>) -> Result<FieldUpdate> {
     match raw {
         None => Ok(FieldUpdate::Keep),
         Some(s) if s.is_empty() => Ok(FieldUpdate::Clear),
@@ -293,7 +325,7 @@ fn platform_update(raw: Option<String>) -> Result<FieldUpdate> {
     }
 }
 
-fn note_update(raw: Option<String>) -> Result<FieldUpdate> {
+pub(crate) fn note_update(raw: Option<String>) -> Result<FieldUpdate> {
     match raw {
         None => Ok(FieldUpdate::Keep),
         Some(s) if s.is_empty() => Ok(FieldUpdate::Clear),
@@ -616,17 +648,15 @@ fn cmd_status(backend: &dyn Backend) -> Result<i32> {
     Ok(0)
 }
 
-// Bare `maskrun`. Single branch point for the two cases: piped/CI output
-// (`maskrun | cat`, no tty) always gets the static summary below; an
-// arrow-key TUI (platform -> secret -> view/edit/delete) is meant to plug
-// into the `interactive_stdio()` arm here — everything it needs already
-// exists on `Backend::list_meta` (name+platform+note, no value read).
-// Branches are identical for now on purpose — the interactive arm is where
-// a future arrow-key TUI plugs in, in place of its `cmd_overview_summary()`.
-#[allow(clippy::if_same_then_else)]
+// Bare `maskrun`. Piped/CI output (`maskrun | cat`, no tty) always gets the
+// static summary below. A real interactive terminal gets the arrow-key TUI
+// (platform -> secret -> view/edit/delete/copy) in tui.rs, which falls back
+// to this same summary itself on a too-small terminal, an unreachable
+// backend, or (redundantly, on purpose — see tui::run_overview) an agent
+// session.
 fn cmd_overview() -> Result<i32> {
     if interactive_stdio() {
-        cmd_overview_summary()
+        tui::run_overview()
     } else {
         cmd_overview_summary()
     }
@@ -634,7 +664,7 @@ fn cmd_overview() -> Result<i32> {
 
 // An at-a-glance view instead of a help dump, so the command surface
 // doesn't have to live in the user's head.
-fn cmd_overview_summary() -> Result<i32> {
+pub(crate) fn cmd_overview_summary() -> Result<i32> {
     println!("maskrun — run commands with secrets from your OS keyring\n");
 
     match keyring::pick_backend() {

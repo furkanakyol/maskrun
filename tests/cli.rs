@@ -528,6 +528,37 @@ fn label_with_no_name_and_no_tty_fails_fast_instead_of_prompting() {
     assert!(String::from_utf8_lossy(&result.stderr).contains("secret name required"));
 }
 
+// The three tests below force `pick_backend()` itself to fail (`dpapi` is
+// Windows-only) — reproducing the CI "no keyring" job's failure mode, which
+// a locally-reachable keyring can't: the ordering bug they guard against
+// only shows up when the backend construction that used to happen before
+// this argument check is the thing that fails. Without the fix, all three
+// report "could not reach"/"only available on Windows" instead of the
+// actionable "secret name required".
+#[test]
+fn put_with_no_name_fails_on_usage_even_when_the_backend_is_unreachable() {
+    let result = run(&["put"], &[("MASKRUN_BACKEND", "dpapi")], None);
+    assert!(!result.status.success());
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(stderr.contains("secret name required"), "stderr: {stderr}");
+}
+
+#[test]
+fn label_with_no_name_fails_on_usage_even_when_the_backend_is_unreachable() {
+    let result = run(&["label"], &[("MASKRUN_BACKEND", "dpapi")], None);
+    assert!(!result.status.success());
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(stderr.contains("secret name required"), "stderr: {stderr}");
+}
+
+#[test]
+fn rm_with_no_name_fails_on_usage_even_when_the_backend_is_unreachable() {
+    let result = run(&["rm"], &[("MASKRUN_BACKEND", "dpapi")], None);
+    assert!(!result.status.success());
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(stderr.contains("secret name required"), "stderr: {stderr}");
+}
+
 #[test]
 fn note_over_200_chars_is_rejected() {
     if !require_keyring() {
