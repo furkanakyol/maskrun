@@ -3,75 +3,76 @@
 #   irm https://raw.githubusercontent.com/furkanakyol/maskrun/main/install.ps1 | iex
 #
 # Options, as environment variables (a piped script cannot prompt):
-#   $env:MASKRUN_BIN        where to install  (default: %LOCALAPPDATA%\maskrun\bin)
-#   $env:MASKRUN_REF        git ref to fetch  (default: main)
-#   $env:MASKRUN_WITH_GUARD set to 1 to also register the Claude Code guard hook
+#   $env:MASKRUN_BIN         where to install    (default: %LOCALAPPDATA%\maskrun\bin)
+#   $env:MASKRUN_VERSION     release to install   (default: latest)
+#   $env:MASKRUN_WITH_GUARD  set to 1 to also register the Claude Code guard hook
+#   $env:MASKRUN_BASE_URL    release base URL, for testing against a mirror
+#                            (default: https://github.com/furkanakyol/maskrun/releases)
 #
-# Installs maskrun plus a maskrun.cmd shim, so `maskrun` works from any shell.
+# Installs one maskrun.exe. To remove it: Remove-Item "$env:MASKRUN_BIN\maskrun.exe"
 
 $ErrorActionPreference = 'Stop'
 
-$repo   = 'furkanakyol/maskrun'
-$ref    = if ($env:MASKRUN_REF) { $env:MASKRUN_REF } else { 'main' }
-$binDir = if ($env:MASKRUN_BIN) { $env:MASKRUN_BIN } else { Join-Path $env:LOCALAPPDATA 'maskrun\bin' }
-$source = "https://raw.githubusercontent.com/$repo/$ref/bin/maskrun"
-$target = Join-Path $binDir 'maskrun'
-$shim   = Join-Path $binDir 'maskrun.cmd'
+$repo    = 'furkanakyol/maskrun'
+$binDir  = if ($env:MASKRUN_BIN) { $env:MASKRUN_BIN } else { Join-Path $env:LOCALAPPDATA 'maskrun\bin' }
+$baseUrl = if ($env:MASKRUN_BASE_URL) { $env:MASKRUN_BASE_URL } else { "https://github.com/$repo/releases" }
+$apiUrl  = "https://api.github.com/repos/$repo/releases/latest"
+# Only Windows target maskrun ships; x86_64 binaries run fine under ARM64's emulator.
+$target  = 'x86_64-pc-windows-msvc'
+$exe     = Join-Path $binDir 'maskrun.exe'
 
 function Fail($message) { Write-Error "error: $message"; exit 1 }
 
-# --- python ----------------------------------------------------------------
-$python = $null
-foreach ($candidate in @('python', 'python3', 'py')) {
-    $found = Get-Command $candidate -ErrorAction SilentlyContinue
-    if (-not $found) { continue }
+# --- version -------------------------------------------------------------
+$version = $env:MASKRUN_VERSION
+if (-not $version) {
     try {
-        & $found.Source -c 'import sys; sys.exit(0 if sys.version_info >= (3,9) else 1)' 2>$null
-        if ($LASTEXITCODE -eq 0) { $python = $found.Source; break }
-    } catch { }
-}
-if (-not $python) {
-    Fail @"
-Python 3.9 or newer is required but was not found on PATH.
-  winget install Python.Python.3.12
-  or download from https://www.python.org/downloads/windows/
-Make sure "Add python.exe to PATH" is checked during installation.
-"@
+        $release = Invoke-RestMethod -Uri $apiUrl -UseBasicParsing
+        $version = $release.tag_name
+    } catch {
+        Fail "could not reach $apiUrl to find the latest version`n$($_.Exception.Message)"
+    }
+    if (-not $version) { Fail "could not parse a version out of $apiUrl" }
 }
 
-# --- download --------------------------------------------------------------
-New-Item -ItemType Directory -Force -Path $binDir | Out-Null
-$tmp = [System.IO.Path]::GetTempFileName()
+$asset   = "maskrun-$version-$target.zip"
+$workDir = Join-Path ([System.IO.Path]::GetTempPath()) ([System.Guid]::NewGuid().ToString())
+New-Item -ItemType Directory -Force -Path $workDir | Out-Null
+$archive = Join-Path $workDir $asset
+$sums    = Join-Path $workDir 'SHA256SUMS'
+
 try {
-    Invoke-WebRequest -Uri $source -OutFile $tmp -UseBasicParsing
-} catch {
-    Fail "download failed: $source`n$($_.Exception.Message)"
+    # --- download ----------------------------------------------------------
+    try {
+        Invoke-WebRequest -Uri "$baseUrl/download/$version/$asset" -OutFile $archive -UseBasicParsing
+        Invoke-WebRequest -Uri "$baseUrl/download/$version/SHA256SUMS" -OutFile $sums -UseBasicParsing
+    } catch {
+        Fail "download failed: $($_.Exception.Message)"
+    }
+
+    # --- checksum ------------------------------------------------------------
+    # Replaces the old release's `ast.parse` sanity check: the one thing
+    # standing between a tampered or truncated download and a secret manager
+    # landing on disk. Not optional, not warn-and-continue.
+    $expectedLine = Select-String -Path $sums -Pattern ([regex]::Escape($asset)) | Select-Object -First 1
+    if (-not $expectedLine) { Fail "SHA256SUMS has no entry for $asset" }
+    $expected = ($expectedLine.Line -split '\s+')[0].TrimStart('*')
+    $actual = (Get-FileHash -Path $archive -Algorithm SHA256).Hash
+    if ($expected.ToLower() -ne $actual.ToLower()) {
+        Fail "checksum mismatch for $asset`n  expected: $expected`n  actual:   $actual`nThe download is corrupted or was tampered with. Not installing."
+    }
+
+    # --- install -------------------------------------------------------------
+    Expand-Archive -Path $archive -DestinationPath $workDir -Force
+    New-Item -ItemType Directory -Force -Path $binDir | Out-Null
+    Copy-Item -Path (Join-Path $workDir 'maskrun.exe') -Destination $exe -Force
+} finally {
+    Remove-Item -Recurse -Force $workDir -ErrorAction SilentlyContinue
 }
 
-$firstLine = (Get-Content $tmp -TotalCount 1)
-if ($firstLine -notmatch '^#!/usr/bin/env python3') {
-    Remove-Item $tmp -Force
-    Fail "downloaded file does not look like maskrun (wrong ref '$ref'?)"
-}
-& $python -c "import ast,sys; ast.parse(open(sys.argv[1], encoding='utf-8').read())" $tmp
-if ($LASTEXITCODE -ne 0) {
-    Remove-Item $tmp -Force
-    Fail "downloaded file is not valid Python - refusing to install it"
-}
-
-Move-Item -Force $tmp $target
-
-# A .cmd shim so `maskrun ...` works without typing `python maskrun`.
-# %* forwards every argument; the exit code is propagated for CI and scripts.
-@"
-@echo off
-"$python" "$target" %*
-exit /b %errorlevel%
-"@ | Set-Content -Path $shim -Encoding ASCII
-
-$version = & $python $target --version
-Write-Host "installed $version -> $target"
-Write-Host "shim: $shim"
+$versionOutput = & $exe --version
+if ($LASTEXITCODE -ne 0) { Fail "installed but did not run: $exe --version" }
+Write-Host "installed $versionOutput -> $exe"
 
 # --- PATH ------------------------------------------------------------------
 $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
@@ -82,10 +83,10 @@ if ($userPath -notlike "*$binDir*") {
     Write-Host "    [Environment]::SetEnvironmentVariable('Path', `"$binDir;`" + [Environment]::GetEnvironmentVariable('Path','User'), 'User')"
 }
 
-# --- optional guard --------------------------------------------------------
+# --- optional guard ----------------------------------------------------------
 if ($env:MASKRUN_WITH_GUARD -eq '1') {
     Write-Host ""
-    & $python $target install-guard --command-path $shim
+    & $exe install-guard
 }
 
 Write-Host ""

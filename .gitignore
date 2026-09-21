@@ -1,5 +1,3 @@
-__pycache__/
-*.pyc
 .maskrun
 .env
 .env.*

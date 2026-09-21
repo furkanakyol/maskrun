@@ -13,7 +13,7 @@ $ maskrun run -- node -e 'console.log(process.env.DATABASE_URL)'
 <masked:DATABASE_URL>
 ```
 
-One file, no build step, no daemon. Linux, macOS and Windows.
+One binary, no runtime dependencies, no daemon. Linux, macOS and Windows.
 
 ---
 
@@ -37,7 +37,8 @@ maskrun closes that path, and the ones next to it.
 
 ## Install
 
-**Linux / macOS**
+**Linux / macOS** — downloads a prebuilt binary, verifies its checksum, no
+compiler needed:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/furkanakyol/maskrun/main/install.sh | sh
@@ -49,12 +50,19 @@ curl -fsSL https://raw.githubusercontent.com/furkanakyol/maskrun/main/install.sh
 irm https://raw.githubusercontent.com/furkanakyol/maskrun/main/install.ps1 | iex
 ```
 
-Or just copy [`bin/maskrun`](bin/maskrun) onto your `PATH` and make it
-executable — it is a single Python file with no dependencies beyond the
-standard library.
+**From a Rust toolchain:**
 
-Requirements: Python 3.9+, and on Linux `secret-tool` (libsecret) with a
-running Secret Service.
+```bash
+cargo install maskrun
+```
+
+**From source:**
+
+```bash
+git clone https://github.com/furkanakyol/maskrun
+cd maskrun && cargo build --release
+# binary at target/release/maskrun
+```
 
 ## Quick start
 
@@ -160,17 +168,25 @@ it should not be sold to you — or by you — as anything more.
 - **A keyring solves storage, not access.** Every process running as you can
   call `secret-tool lookup` or `security find-generic-password`, including your
   agent. The guard raises the cost of doing it by accident; it does not make it
-  impossible.
+  impossible. The same is true of you: if a human pastes an unmasked value into
+  the transcript by hand, no tool downstream of that keystroke can catch it.
 - **Code the guard cannot read.** Heredoc bodies and script files are treated
   as data, not commands — deliberately, because parsing them produced false
-  positives. So a script that calls `open(".env").read()` gets through. A
-  pattern matcher never catches arbitrary code.
+  positives. So a script that reads `.env` itself from inside its own source
+  gets through. A pattern matcher never catches arbitrary code.
 - **Process environment.** While `maskrun run` is running, its child's
   environment is readable via `/proc/<pid>/environ`. The guard blocks that path
   directly, but env injection has this shape by design.
-- **`ps` during a write.** On macOS, `security` takes the value as an argument,
-  so it is briefly visible in the process list to your own user. `put` and
-  `import` are human-run commands, which limits the window.
+- **`ps` during a write — closed.** On macOS, the value used to reach `security`
+  as a CLI argument, briefly visible in the process list via `ps`. That path is
+  gone: maskrun now calls Security.framework's generic-password API directly,
+  so the value never becomes an argv the OS has to expose to anyone.
+- **Pipeline-segment matching, not a shell parser.** The guard evaluates each
+  segment of a pipeline on its own, which is what lets `sed 's/maskrun
+  get/x/' notes.md` through — that text never invokes `maskrun get`, it just
+  mentions it. The same scoping means the guard does not follow a command
+  through indirection: `echo 'maskrun get x' | sh` reads as an `echo`, not as
+  the command `sh` ends up running.
 
 If you want a real boundary, the agent's shell has to run somewhere that cannot
 reach the keyring at all — no D-Bus session socket on Linux, a separate user
@@ -180,22 +196,50 @@ tool, spend caps, rotation, and short-lived credentials where they exist.
 
 ## Backends
 
-| Platform | Backend | Storage |
+| Platform | Backend name | Storage |
 |---|---|---|
-| Linux | `secret-service` | libsecret via `secret-tool` (gnome-keyring, KWallet, KeePassXC) |
-| macOS | `keychain` | login keychain via `security` |
-| Windows | `dpapi` | DPAPI-encrypted files under `%LOCALAPPDATA%\maskrun` |
+| Linux | `secret-service` | libsecret's Secret Service, over D-Bus directly (`dbus-secret-service` crate) — gnome-keyring, KWallet, KeePassXC |
+| macOS | `keychain` | login keychain via Security.framework's generic-password API (`security-framework` crate) |
+| Windows | `dpapi` | Windows Credential Manager (`windows` crate, `Win32_Security_Credentials`) — the name is kept from the old DPAPI-file backend for override compatibility; the storage underneath it is not DPAPI files anymore |
 
-Windows has no scriptable equivalent of `secret-tool`: Credential Manager's
-PowerShell module is not built in, and `cmdkey` cannot read a secret back.
-DPAPI ships with the OS, ties the ciphertext to the logged-in account, and
-needs no third-party dependency.
+Earlier versions shelled out to `secret-tool` on Linux and `security` on
+macOS for every operation, and hand-rolled DPAPI file storage on Windows. All
+three now go through a library binding to the platform API for `put`/`get`/
+`delete` instead of a subprocess or hand-written crypto — no `secret-tool`
+install required on Linux, and on macOS the secret value no longer becomes a
+CLI argument. (macOS `list` still shells out to `security dump-keychain` to
+enumerate names — that call takes no secret value as an argument, so nothing
+new is exposed; `security-framework` has no service-scoped enumeration call
+to replace it with.)
+
+Linux storage keeps the schema `secret-tool lookup service maskrun name
+<name>` expects (`service` + `name` attributes), so a secret maskrun stores is
+still readable with the standard CLI if you need to check by hand — maskrun
+itself just no longer depends on that CLI being installed.
 
 Override detection with `MASKRUN_BACKEND=secret-service|keychain|dpapi`.
 
-All three are exercised by CI on every push, on real `ubuntu-latest`,
-`macos-latest` and `windows-latest` runners — including a job that fails if the
-keyring tests were merely skipped.
+### What's actually verified
+
+CI has never actually run for this repo, on any platform — see below. So
+"verified" here means run by hand, not a green check.
+
+The Linux backend runs for real: 85 tests pass locally against a live Secret
+Service, including the keyring round-trip itself, not just the code around
+it.
+
+The macOS and Windows backends **have never been run at all**, against a real
+Keychain or Credential Manager or otherwise — there is no such machine in this
+loop. GitHub Actions does not start on this account right now — every run
+across every private repo dies at `startup_failure` before a single job is
+scheduled, most likely an account-level billing or email-verification issue,
+not anything in this repo's workflow file. There is no CI badge in this
+README for exactly that reason: a badge implies a check that actually ran,
+and none has, on any platform. For a secrets tool, that is the one place this
+cannot be allowed to overstate.
+
+Practically: the Linux path is battle-tested by hand, the other two are
+"compiles, matches the platform docs, has never touched real hardware."
 
 ## Commands
 
@@ -232,6 +276,13 @@ Agent sessions are detected from `CLAUDECODE`, `CLAUDE_CODE_ENTRYPOINT`,
 `AI_AGENT`, `AIDER_CHAT`, `CURSOR_AGENT`, `OPENAI_CODEX`, `GEMINI_CLI` and
 `REPLIT_AGENT`. For anything else, set `MASKRUN_AGENT=1` in the harness.
 
+## Platform support
+
+- **Linux** — glibc. Verified locally: 85 tests passing against a real Secret
+  Service (see "What's actually verified" above — CI itself has not run).
+- **macOS** — Intel and Apple Silicon. Implemented, never run.
+- **Windows** — x86_64. Implemented, never run.
+
 ## Prior art
 
 [`envchain`](https://github.com/sorah/envchain) put secrets in the keychain and
@@ -249,21 +300,22 @@ working with an AI agent, `envchain` may be all you need.
 ## Development
 
 ```bash
-python3 test/test_maskrun.py          # everything reachable here
-python3 test/test_maskrun.py -v       # verbose
-make test
+cargo test -- --test-threads=1   # single-threaded: backends share real keyring state
+cargo clippy --all-targets -- -D warnings
+cargo fmt --check
+make test                        # same test run
+make lint                        # fmt --check + clippy
 ```
 
 Keyring tests skip themselves when no backend is reachable so the guard tests
-still run in a bare container; CI passes `--require-keyring` to make sure that
-skip never masquerades as a pass.
+still run in a bare container.
 
 Secret values in the test suite are randomly generated and never printed —
 assertions check for absence or presence, never equality against a logged
 value.
 
-Contributions welcome. Adding a backend means implementing four methods
-(`put`, `get`, `delete`, `list`); adding a harness means one entry under
+Contributions welcome. Adding a backend means implementing the `Backend`
+trait's `put`/`get`/`delete`/`list`; adding a harness means one entry under
 `integrations/`.
 
 ## License

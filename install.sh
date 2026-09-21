@@ -4,84 +4,101 @@
 #   curl -fsSL https://raw.githubusercontent.com/furkanakyol/maskrun/main/install.sh | sh
 #
 # Options, as environment variables (a piped script cannot prompt):
-#   MASKRUN_BIN=~/bin          where to install      (default: ~/.local/bin)
-#   MASKRUN_REF=v0.1.0         git ref to fetch      (default: main)
+#   MASKRUN_BIN=~/bin          where to install        (default: ~/.local/bin)
+#   MASKRUN_VERSION=v0.1.0     release to install       (default: latest)
 #   MASKRUN_WITH_GUARD=1       also register the Claude Code guard hook
+#   MASKRUN_BASE_URL=...       release base URL, for testing against a mirror
+#                              (default: https://github.com/furkanakyol/maskrun/releases)
 #
-# Installs one file. To remove it: rm "$MASKRUN_BIN/maskrun"
+# Installs one binary. To remove it: rm "$MASKRUN_BIN/maskrun"
 set -eu
 
 REPO="furkanakyol/maskrun"
-REF="${MASKRUN_REF:-main}"
 BIN_DIR="${MASKRUN_BIN:-$HOME/.local/bin}"
-SOURCE_URL="https://raw.githubusercontent.com/$REPO/$REF/bin/maskrun"
-TARGET="$BIN_DIR/maskrun"
+BASE_URL="${MASKRUN_BASE_URL:-https://github.com/$REPO/releases}"
+API_URL="https://api.github.com/repos/$REPO/releases/latest"
 
 say()  { printf '%s\n' "$*"; }
 warn() { printf 'warning: %s\n' "$*" >&2; }
 die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
 
-# --- python ----------------------------------------------------------------
-PYTHON=""
-for candidate in python3 python; do
-    if command -v "$candidate" >/dev/null 2>&1; then
-        if "$candidate" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)' 2>/dev/null; then
-            PYTHON="$candidate"
-            break
-        fi
+fetch() {
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL "$1" -o "$2"
+    elif command -v wget >/dev/null 2>&1; then
+        wget -qO "$2" "$1"
+    else
+        die "neither curl nor wget is available"
     fi
-done
-[ -n "$PYTHON" ] || die "Python 3.9 or newer is required but was not found on PATH.
-  Debian/Ubuntu: apt install python3
-  Fedora:        dnf install python3
-  macOS:         already present, or 'brew install python'"
+}
 
-# --- keyring prerequisites -------------------------------------------------
+# --- platform ----------------------------------------------------------------
 OS="$(uname -s)"
+ARCH="$(uname -m)"
 case "$OS" in
-    Darwin)
-        command -v security >/dev/null 2>&1 \
-            || warn "/usr/bin/security not found; the macOS keychain backend will not work."
-        ;;
-    Linux)
-        if ! command -v secret-tool >/dev/null 2>&1; then
-            warn "secret-tool (libsecret) not found — maskrun needs it to reach the keyring.
-  Debian/Ubuntu: apt install libsecret-tools
-  Fedora:        dnf install libsecret
-  Arch:          pacman -S libsecret
-  You also need a running Secret Service (gnome-keyring, KWallet's Secret Service, or KeePassXC)."
-        fi
-        ;;
-    *)
-        warn "unrecognised system '$OS'. maskrun supports Linux, macOS and Windows.
-  On Windows use install.ps1 instead."
-        ;;
+    Linux)  os_part=unknown-linux-gnu ;;
+    Darwin) os_part=apple-darwin ;;
+    *) die "unsupported OS '$OS'. maskrun ships Linux, macOS and Windows builds.
+  Windows: use install.ps1 instead.
+  Anything else: cargo install maskrun" ;;
 esac
+case "$ARCH" in
+    x86_64|amd64)  arch_part=x86_64 ;;
+    arm64|aarch64) arch_part=aarch64 ;;
+    *) die "unsupported architecture '$ARCH'.
+  Build from source instead: cargo install maskrun" ;;
+esac
+TARGET="${arch_part}-${os_part}"
 
-# --- download --------------------------------------------------------------
-TMP="$(mktemp)"
-trap 'rm -f "$TMP"' EXIT INT TERM
+WORKDIR="$(mktemp -d)"
+trap 'rm -rf "$WORKDIR"' EXIT INT TERM
 
-if command -v curl >/dev/null 2>&1; then
-    curl -fsSL "$SOURCE_URL" -o "$TMP" || die "download failed: $SOURCE_URL"
-elif command -v wget >/dev/null 2>&1; then
-    wget -qO "$TMP" "$SOURCE_URL" || die "download failed: $SOURCE_URL"
-else
-    die "neither curl nor wget is available"
+# --- version -------------------------------------------------------------
+VERSION="${MASKRUN_VERSION:-}"
+if [ -z "$VERSION" ]; then
+    fetch "$API_URL" "$WORKDIR/latest.json" || die "could not reach $API_URL to find the latest version"
+    VERSION="$(grep '"tag_name"' "$WORKDIR/latest.json" | head -n1 | sed -E 's/.*"tag_name":[[:space:]]*"([^"]+)".*/\1/')"
+    [ -n "$VERSION" ] || die "could not parse a version out of $API_URL"
 fi
 
-# A truncated or error-page download must never be installed.
-head -n 1 "$TMP" | grep -q '^#!/usr/bin/env python3' \
-    || die "downloaded file does not look like maskrun (wrong ref '$REF'?)"
-"$PYTHON" -c "import ast,sys; ast.parse(open(sys.argv[1]).read())" "$TMP" \
-    || die "downloaded file is not valid Python — refusing to install it"
+ASSET="maskrun-${VERSION}-${TARGET}.tar.gz"
+ARCHIVE="$WORKDIR/$ASSET"
+SUMS="$WORKDIR/SHA256SUMS"
 
+# --- download --------------------------------------------------------------
+fetch "$BASE_URL/download/$VERSION/$ASSET" "$ARCHIVE" \
+    || die "download failed: $BASE_URL/download/$VERSION/$ASSET"
+fetch "$BASE_URL/download/$VERSION/SHA256SUMS" "$SUMS" \
+    || die "download failed: $BASE_URL/download/$VERSION/SHA256SUMS"
+
+# --- checksum ----------------------------------------------------------------
+# This is what replaces the old release's `ast.parse` sanity check: the one
+# thing standing between a tampered or truncated download and a secret
+# manager landing on disk. Not optional, not warn-and-continue.
+EXPECTED="$(awk -v f="$ASSET" '{fn=$2; sub(/^\*/, "", fn); if (fn == f) print $1}' "$SUMS")"
+[ -n "$EXPECTED" ] || die "SHA256SUMS has no entry for $ASSET"
+
+if command -v sha256sum >/dev/null 2>&1; then
+    ACTUAL="$(sha256sum "$ARCHIVE" | awk '{print $1}')"
+elif command -v shasum >/dev/null 2>&1; then
+    ACTUAL="$(shasum -a 256 "$ARCHIVE" | awk '{print $1}')"
+else
+    die "neither sha256sum nor shasum is available to verify the download"
+fi
+
+[ "$EXPECTED" = "$ACTUAL" ] || die "checksum mismatch for $ASSET
+  expected: $EXPECTED
+  actual:   $ACTUAL
+The download is corrupted or was tampered with. Not installing."
+
+# --- install ---------------------------------------------------------------
+tar -xzf "$ARCHIVE" -C "$WORKDIR" maskrun
 mkdir -p "$BIN_DIR"
-cat "$TMP" > "$TARGET"
-chmod 755 "$TARGET"
+install -m 755 "$WORKDIR/maskrun" "$BIN_DIR/maskrun"
 
-VERSION="$("$PYTHON" "$TARGET" --version 2>/dev/null || echo 'maskrun (version unknown)')"
-say "installed $VERSION -> $TARGET"
+VERSION_OUTPUT="$("$BIN_DIR/maskrun" --version 2>/dev/null)" \
+    || die "installed but did not run: $BIN_DIR/maskrun --version"
+say "installed $VERSION_OUTPUT -> $BIN_DIR/maskrun"
 
 # --- PATH ------------------------------------------------------------------
 case ":$PATH:" in
@@ -93,10 +110,10 @@ case ":$PATH:" in
         ;;
 esac
 
-# --- optional guard --------------------------------------------------------
+# --- optional guard ----------------------------------------------------------
 if [ "${MASKRUN_WITH_GUARD:-0}" = "1" ]; then
     say ""
-    "$PYTHON" "$TARGET" install-guard --command-path "$TARGET" || \
+    "$BIN_DIR/maskrun" install-guard || \
         warn "could not register the guard hook; do it later with: maskrun install-guard"
 fi
 

@@ -69,11 +69,21 @@ in the file.
 The guard is a pattern matcher, not a shell parser, so it will occasionally
 refuse something innocent. Two deliberate scoping decisions keep that rare:
 
-- The `.env` check looks at **pipeline segments**, so a `.env` that appears
-  only in prose does not count — what matters is whether it is an argument to
-  a command that prints file contents.
+- **Every rule is checked against pipeline segments, not the whole command
+  string.** A flagged name only fires when it is the command actually
+  invoked (or, for env-var rules, actually assigned) in that segment — not
+  whenever it merely appears somewhere in the line. This is why `sed
+  's/maskrun get/x/' notes.md` is allowed: `maskrun get` never runs there,
+  the text just sits inside `sed`'s own argument. Same reasoning covers a
+  `.env` that appears only in prose, or as some other command's argument
+  that isn't a file-reading one.
 - **Heredoc bodies are ignored.** A body is data, not a command. Without this,
   writing documentation that merely mentions `cat .env` tripped the guard.
+
+The trade-off is real: segment-level matching does not follow a command
+through indirection. `echo 'maskrun get x' | sh` is read as an `echo`
+segment and a `sh` segment, neither of which is the flagged command as
+written, so it passes — see the README's "What this is not".
 
 If you hit a false positive, it is a bug worth reporting — include the exact
 command. If you need to get past one immediately, `--remove` the guard, do the
