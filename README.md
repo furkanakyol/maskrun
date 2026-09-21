@@ -217,6 +217,14 @@ Linux storage keeps the schema `secret-tool lookup service maskrun name
 still readable with the standard CLI if you need to check by hand — maskrun
 itself just no longer depends on that CLI being installed.
 
+### Where the platform label and note live
+
+| Platform | Where |
+|---|---|
+| Linux | Two extra Secret Service attributes, `platform` and `note`, alongside the existing `service`/`name` — `secret-tool lookup` only matches on the attributes you give it, so these ride along without affecting anything that already reads `service`+`name`. |
+| macOS | The generic password's `kSecAttrDescription` (platform) and `kSecAttrComment` (note) fields, set/read through `security-framework`'s attribute-search and attribute-only update APIs — the stored value itself is never touched by a relabel. |
+| Windows | Both encoded into the one `CREDENTIALW.Comment` field Credential Manager offers (`platform=<p><US>note=<n>`, `<US>` = U+001F): there's no separate attribute store here, and relabelling has to rewrite the whole entry (value included) because `CredWriteW` has no partial-update call. |
+
 Override detection with `MASKRUN_BACKEND=secret-service|keychain|dpapi`.
 
 ### What's actually verified
@@ -225,6 +233,12 @@ All three backends are exercised against a real keyring in CI: Secret Service
 on Linux, Keychain on macOS, Credential Manager on Windows. The keyring tests
 round-trip an actual secret rather than mocking the backend, and a job with no
 keyring installed at all proves the guard still answers.
+
+The platform label / note feature is the same story: exercised against a
+real Secret Service on Linux (including the `secret-tool`/attribute-schema
+compatibility check), type-checked cross-target for macOS and Windows the
+same as the rest of the platform code, but only actually run against a real
+Keychain or Credential Manager once those CI jobs do.
 
 The first CI run that ever started found three genuine bugs in the platform
 code, all in paths a Linux build never type-checks because they are
@@ -244,15 +258,21 @@ on a real desktop prompts the user to create a keyring and outlives the test.
 
 ```
 maskrun put <name>                    store a secret (prompts; not echoed)
+maskrun put                           fully interactive: asks name, platform, note, value
 maskrun put <name> --stdin            store from stdin (for scripts)
+maskrun put <name> --for X --note Y   tag it with a platform and a note while storing
+maskrun label <name> --for X          tag (or retag) an existing secret's platform
+maskrun label <name> --for ""         clear its platform
 maskrun get <name>                    print it (refused in an agent session)
-maskrun list                          names only
-maskrun rm <name>                     delete
+maskrun list                          grouped by platform, with notes, never values
+maskrun list --plain                  flat, sorted names only, one per line (for scripts)
+maskrun rm <name>                     delete (no name: pick from a numbered list)
 maskrun status                        check the manifest against the keyring
 maskrun run [--raw|--mask] -- CMD     run with the manifest injected
 maskrun exec VAR=name -- CMD          run with explicit pairs, no manifest
 maskrun -- CMD                        shorthand for run
 maskrun import <.env> [--dry-run]     move a .env into the keyring
+maskrun completions <fish|bash|zsh>   print a shell completion script
 maskrun install-guard [--remove]      register the agent guard
 maskrun hook                          the guard itself (reads JSON on stdin)
 ```
@@ -261,6 +281,53 @@ maskrun hook                          the guard itself (reads JSON on stdin)
 `EXPO_PUBLIC_` and `GATSBY_` variables: they are compiled into your client
 bundle and shipped to every visitor, so they are configuration, not secrets, and
 moving them buys nothing. `--all` overrides.
+
+### Platform labels and notes
+
+Once you're past a handful of secrets, a flat name is not enough to remember
+what each one is for — especially when a platform has more than one key and
+the difference between them is scope, not name. `--for` tags a secret with a
+platform/service; `--note` adds a short free-text description:
+
+```
+$ maskrun put gh-release-token --for github --note "fine-grained, contents+plan"
+stored: gh-release-token
+
+$ maskrun label vault-token-github --for github --note "fine-grained, repo+plan"
+labelled: vault-token-github
+
+$ maskrun list
+github
+  gh-release-token       fine-grained, contents+plan
+  vault-token-github     fine-grained, repo+plan
+(no platform)
+  pos-terminal-electron-api-url
+```
+
+Both flags are optional and apply to secrets that already have neither.
+`label` retags an existing secret after the fact; on either command, giving
+`--for ""` (or `--note ""`) clears that field, and leaving a flag off entirely
+leaves the existing value alone — `put`-ing over a secret's value never
+silently drops its label. **The platform and note are not secrets**: they are
+stored unmasked, are visible to an AI agent session, and are shown by `list`
+and `status`. Do not put a secret value in `--note`; it is capped at 200
+characters and may not contain a newline.
+
+`maskrun` with no arguments (or piped, e.g. `maskrun | cat`) prints a short
+overview instead: the manifest status and the grouped secret list above, so
+you don't have to hold the command surface in your head.
+
+### Shell completion
+
+```bash
+maskrun completions fish > ~/.config/fish/completions/maskrun.fish
+maskrun completions bash > ~/.local/share/bash-completion/completions/maskrun
+maskrun completions zsh > ~/.zfunc/_maskrun   # then `fpath+=~/.zfunc` before compinit
+```
+
+Beyond flags and subcommands, `maskrun get`/`rm`/`label` complete actual
+secret names — fish does this out of the box (via the same `maskrun list
+--plain` this flag exists for); bash/zsh get the static completions only.
 
 ## Environment variables
 

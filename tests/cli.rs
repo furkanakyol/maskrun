@@ -308,3 +308,253 @@ fn double_dash_argv_split_reaches_real_command() {
         "hi -- --flag"
     );
 }
+
+#[test]
+fn put_with_platform_and_note_groups_under_that_platform_in_list() {
+    if !require_keyring() {
+        return;
+    }
+    let name = format!("maskrun-test-{}", unique_suffix());
+    let platform = format!("plat-{}", unique_suffix());
+    let put = run(
+        &[
+            "put",
+            &name,
+            "--stdin",
+            "--for",
+            &platform,
+            "--note",
+            "fine-grained, repo+plan",
+        ],
+        &[],
+        Some(random_value().as_bytes()),
+    );
+    assert!(
+        put.status.success(),
+        "{}",
+        String::from_utf8_lossy(&put.stderr)
+    );
+    let _cleanup = StoredSecret { name: name.clone() };
+
+    let listed = run(&["list"], &[], None);
+    let out = String::from_utf8_lossy(&listed.stdout);
+    let plat_line = out.find(&platform).expect("platform header missing");
+    let name_line = out.find(&name).expect("secret name missing");
+    assert!(
+        plat_line < name_line,
+        "platform header should precede the secret: {out}"
+    );
+    assert!(out.contains("fine-grained, repo+plan"), "{out}");
+}
+
+#[test]
+fn put_without_for_leaves_secret_under_no_platform() {
+    if !require_keyring() {
+        return;
+    }
+    let secret = store(random_value().as_bytes());
+    let listed = run(&["list"], &[], None);
+    let out = String::from_utf8_lossy(&listed.stdout);
+    let no_platform_line = out
+        .find("(no platform)")
+        .expect("(no platform) header missing");
+    let name_line = out.find(&secret.name).expect("secret name missing");
+    assert!(no_platform_line < name_line, "{out}");
+}
+
+#[test]
+fn label_tags_an_existing_secret_after_the_fact() {
+    if !require_keyring() {
+        return;
+    }
+    let secret = store(random_value().as_bytes());
+    let platform = format!("plat-{}", unique_suffix());
+    let label = run(&["label", &secret.name, "--for", &platform], &[], None);
+    assert!(
+        label.status.success(),
+        "{}",
+        String::from_utf8_lossy(&label.stderr)
+    );
+
+    let listed = run(&["list"], &[], None);
+    let out = String::from_utf8_lossy(&listed.stdout);
+    let plat_line = out.find(&platform).expect("platform header missing");
+    let name_line = out.find(&secret.name).expect("secret name missing");
+    assert!(plat_line < name_line, "{out}");
+}
+
+#[test]
+fn label_for_empty_string_clears_the_platform() {
+    if !require_keyring() {
+        return;
+    }
+    let secret = store(random_value().as_bytes());
+    let platform = format!("plat-{}", unique_suffix());
+    let label = run(&["label", &secret.name, "--for", &platform], &[], None);
+    assert!(label.status.success());
+
+    let clear = run(&["label", &secret.name, "--for", ""], &[], None);
+    assert!(
+        clear.status.success(),
+        "{}",
+        String::from_utf8_lossy(&clear.stderr)
+    );
+
+    let listed = run(&["list"], &[], None);
+    let out = String::from_utf8_lossy(&listed.stdout);
+    let no_platform_line = out
+        .find("(no platform)")
+        .expect("(no platform) header missing");
+    let name_line = out.find(&secret.name).expect("secret name missing");
+    assert!(no_platform_line < name_line, "{out}");
+    assert!(
+        !out.contains(&platform),
+        "cleared platform still shown: {out}"
+    );
+}
+
+#[test]
+fn put_without_for_flag_preserves_the_existing_label() {
+    if !require_keyring() {
+        return;
+    }
+    let name = format!("maskrun-test-{}", unique_suffix());
+    let platform = format!("plat-{}", unique_suffix());
+    let first = run(
+        &["put", &name, "--stdin", "--for", &platform],
+        &[],
+        Some(random_value().as_bytes()),
+    );
+    assert!(first.status.success());
+    let _cleanup = StoredSecret { name: name.clone() };
+
+    // Overwrite the value with no --for at all: the old label must survive.
+    let second = run(
+        &["put", &name, "--stdin"],
+        &[],
+        Some(random_value().as_bytes()),
+    );
+    assert!(second.status.success());
+
+    let listed = run(&["list"], &[], None);
+    let out = String::from_utf8_lossy(&listed.stdout);
+    let plat_line = out.find(&platform).expect("label was lost on overwrite");
+    let name_line = out.find(&name).expect("secret name missing");
+    assert!(plat_line < name_line, "{out}");
+}
+
+#[test]
+fn list_plain_stays_flat_sorted_and_unlabelled() {
+    if !require_keyring() {
+        return;
+    }
+    let name = format!("maskrun-test-{}", unique_suffix());
+    let put = run(
+        &[
+            "put",
+            &name,
+            "--stdin",
+            "--for",
+            "some-platform",
+            "--note",
+            "some note",
+        ],
+        &[],
+        Some(random_value().as_bytes()),
+    );
+    assert!(put.status.success());
+    let _cleanup = StoredSecret { name: name.clone() };
+
+    let listed = run(&["list", "--plain"], &[], None);
+    assert!(listed.status.success());
+    let out = String::from_utf8_lossy(&listed.stdout);
+    assert!(out.lines().any(|l| l == name), "{out}");
+    assert!(!out.contains("some-platform"), "{out}");
+    assert!(!out.contains("some note"), "{out}");
+    assert!(!out.contains("(no platform)"), "{out}");
+}
+
+#[test]
+fn list_groups_platforms_alphabetically_with_no_platform_last() {
+    if !require_keyring() {
+        return;
+    }
+    let a = format!("plat-a-{}", unique_suffix());
+    let z = format!("plat-z-{}", unique_suffix());
+    let s1 = store(random_value().as_bytes());
+    let s2 = store(random_value().as_bytes());
+    let _s3 = store(random_value().as_bytes()); // stays unlabelled
+    assert!(run(&["label", &s1.name, "--for", &z], &[], None)
+        .status
+        .success());
+    assert!(run(&["label", &s2.name, "--for", &a], &[], None)
+        .status
+        .success());
+
+    let listed = run(&["list"], &[], None);
+    let out = String::from_utf8_lossy(&listed.stdout);
+    let pos_a = out.find(&a).unwrap();
+    let pos_z = out.find(&z).unwrap();
+    let pos_none = out.find("(no platform)").unwrap();
+    assert!(pos_a < pos_z, "{out}");
+    assert!(pos_z < pos_none, "{out}");
+}
+
+#[test]
+fn label_with_no_flags_and_no_tty_is_a_clear_error_not_a_hang() {
+    if !require_keyring() {
+        return;
+    }
+    let secret = store(random_value().as_bytes());
+    // The test harness's child stdin/stdout are pipes, never a tty, so this
+    // must fail immediately instead of trying to prompt.
+    let result = run(&["label", &secret.name], &[], None);
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("nothing to do"));
+}
+
+#[test]
+fn put_with_no_name_and_no_tty_fails_fast_instead_of_prompting() {
+    // No keyring needed: this must fail before ever touching the backend.
+    let result = run(&["put"], &[], None);
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("secret name required"));
+}
+
+#[test]
+fn label_with_no_name_and_no_tty_fails_fast_instead_of_prompting() {
+    let result = run(&["label"], &[], None);
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("secret name required"));
+}
+
+#[test]
+fn note_over_200_chars_is_rejected() {
+    if !require_keyring() {
+        return;
+    }
+    let name = format!("maskrun-test-{}", unique_suffix());
+    let long_note = "a".repeat(201);
+    let result = run(
+        &["put", &name, "--stdin", "--note", &long_note],
+        &[],
+        Some(random_value().as_bytes()),
+    );
+    assert!(!result.status.success());
+    let _ = run(&["rm", &name], &[], None);
+}
+
+#[test]
+fn note_with_a_newline_is_rejected() {
+    if !require_keyring() {
+        return;
+    }
+    let name = format!("maskrun-test-{}", unique_suffix());
+    let result = run(
+        &["put", &name, "--stdin", "--note", "line one\nline two"],
+        &[],
+        Some(random_value().as_bytes()),
+    );
+    assert!(!result.status.success());
+    let _ = run(&["rm", &name], &[], None);
+}

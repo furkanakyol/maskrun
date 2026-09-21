@@ -140,6 +140,7 @@ pub fn exec_with_env(command: &[String], injected: &HashMap<String, String>) -> 
 mod tests {
     use super::*;
     use crate::error::Error as MaskrunError;
+    use crate::keyring::MetaUpdate;
 
     #[derive(Default)]
     struct FakeBackend {
@@ -151,7 +152,7 @@ mod tests {
         fn name(&self) -> &'static str {
             "fake"
         }
-        fn put(&self, _secret: &str, _value: &str) -> Result<()> {
+        fn put(&self, _secret: &str, _value: &str, _meta: &MetaUpdate) -> Result<()> {
             Ok(())
         }
         fn get(&self, secret: &str) -> Result<Option<String>> {

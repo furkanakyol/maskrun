@@ -4,13 +4,85 @@ use std::collections::HashMap;
 use crate::error::{Error, Result};
 
 pub const SERVICE: &str = "maskrun";
+pub const NOTE_MAX_LEN: usize = 200;
+
+/// Platform label and free-text note attached to a secret. Neither is a
+/// secret: both are stored unmasked and shown in an agent session.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SecretMeta {
+    pub platform: Option<String>,
+    pub note: Option<String>,
+}
+
+impl SecretMeta {
+    fn merge(&self, update: &MetaUpdate) -> SecretMeta {
+        SecretMeta {
+            platform: update.platform.resolve(self.platform.clone()),
+            note: update.note.resolve(self.note.clone()),
+        }
+    }
+}
+
+/// One field's requested change: left alone, explicitly cleared (`--for ""`),
+/// or set to a new value. Plain `Option<String>` can't tell "not given" apart
+/// from "given empty", and both are meaningful here.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum FieldUpdate {
+    #[default]
+    Keep,
+    Clear,
+    Set(String),
+}
+
+impl FieldUpdate {
+    fn resolve(&self, existing: Option<String>) -> Option<String> {
+        match self {
+            FieldUpdate::Keep => existing,
+            FieldUpdate::Clear => None,
+            FieldUpdate::Set(v) => Some(v.clone()),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct MetaUpdate {
+    pub platform: FieldUpdate,
+    pub note: FieldUpdate,
+}
 
 pub trait Backend {
     fn name(&self) -> &'static str;
-    fn put(&self, secret: &str, value: &str) -> Result<()>;
+    fn put(&self, secret: &str, value: &str, meta: &MetaUpdate) -> Result<()>;
     fn get(&self, secret: &str) -> Result<Option<String>>;
     fn delete(&self, secret: &str) -> Result<()>;
     fn list(&self) -> Result<Vec<String>>;
+
+    // Absence is a valid, common state, not an error — callers that already
+    // know a secret exists (list/status) shouldn't have to special-case it.
+    fn get_meta(&self, _secret: &str) -> Result<SecretMeta> {
+        Ok(SecretMeta::default())
+    }
+
+    fn list_meta(&self) -> Result<Vec<(String, SecretMeta)>> {
+        self.list()?
+            .into_iter()
+            .map(|name| {
+                let meta = self.get_meta(&name)?;
+                Ok((name, meta))
+            })
+            .collect()
+    }
+
+    // Relabel without touching the stored value. The default (read value,
+    // re-`put` it) is the only option on a backend with no attribute-only
+    // update call; Linux and macOS override this with one that never reads
+    // the secret at all.
+    fn set_meta(&self, secret: &str, update: &MetaUpdate) -> Result<()> {
+        let value = self
+            .get(secret)?
+            .ok_or_else(|| Error::msg(format!("no such secret: {secret}")))?;
+        self.put(secret, &value, update)
+    }
 
     // Locked looks identical to empty to get()/list() on Secret Service;
     // default false since Keychain/Credential Manager expose no comparable
@@ -22,6 +94,8 @@ pub trait Backend {
 
 // `^[A-Za-z0-9][A-Za-z0-9._-]*$`, written by hand instead of with `regex` —
 // `regex` is kept for mask.rs/guard.rs, not needed for one fixed pattern.
+// Also used for platform labels: same charset, same reasoning to keep them
+// safe to embed in Windows' encoded Comment field without escaping.
 pub fn check_name(secret: &str) -> Result<&str> {
     let mut chars = secret.chars();
     let ok = match chars.next() {
@@ -37,6 +111,27 @@ pub fn check_name(secret: &str) -> Result<&str> {
         )));
     }
     Ok(secret)
+}
+
+// No newlines: a note shares the Windows Comment encoding's one line with
+// the platform label (see windows::encode_meta), and a control character
+// there would corrupt the split back into fields. The length cap is a
+// tripwire against pasting an actual secret into `--note` by accident.
+pub fn check_note(note: &str) -> Result<&str> {
+    if note.chars().any(|c| c.is_control()) {
+        return Err(Error::msg(
+            "note may not contain control characters (including newlines) — keep it \
+             to one line.",
+        ));
+    }
+    if note.chars().count() > NOTE_MAX_LEN {
+        return Err(Error::msg(format!(
+            "note is too long ({} chars, max {NOTE_MAX_LEN}) — this is a label, not a \
+             place to paste a secret.",
+            note.chars().count()
+        )));
+    }
+    Ok(note)
 }
 
 pub fn pick_backend() -> Result<Box<dyn Backend>> {
@@ -106,7 +201,7 @@ fn credential_manager_backend() -> Result<Box<dyn Backend>> {
 #[cfg(target_os = "linux")]
 pub mod linux {
     use super::*;
-    use dbus_secret_service::{EncryptionType, SecretService};
+    use dbus_secret_service::{EncryptionType, Item, SecretService};
 
     pub struct SecretServiceBackend {
         ss: SecretService,
@@ -159,6 +254,14 @@ pub mod linux {
             HashMap::from([("service", SERVICE), ("name", secret)])
         }
 
+        fn meta_from_attrs(attrs: &HashMap<String, String>) -> SecretMeta {
+            let get = |k: &str| attrs.get(k).filter(|s| !s.is_empty()).cloned();
+            SecretMeta {
+                platform: get("platform"),
+                note: get("note"),
+            }
+        }
+
         // Covers a dismissed prompt and one never shown (timeout 0) alike;
         // never suggests `maskrun put` — the secrets are still there.
         fn locked_error(e: dbus_secret_service::Error) -> Error {
@@ -184,6 +287,15 @@ pub mod linux {
             }
             Ok(())
         }
+
+        fn find(&self, secret: &str) -> Result<Vec<Item<'_>>> {
+            self.unlock_all_collections()?;
+            let found = self
+                .ss
+                .search_items(Self::search_attrs(secret))
+                .map_err(|e| Error::msg(format!("secret-service: {e}")))?;
+            Ok(found.unlocked.into_iter().chain(found.locked).collect())
+        }
     }
 
     impl Backend for SecretServiceBackend {
@@ -191,7 +303,7 @@ pub mod linux {
             "secret-service"
         }
 
-        fn put(&self, secret: &str, value: &str) -> Result<()> {
+        fn put(&self, secret: &str, value: &str, update: &MetaUpdate) -> Result<()> {
             let collection = self
                 .ss
                 .get_any_collection()
@@ -200,10 +312,32 @@ pub mod linux {
             // (unlike the incidental get()/list() calls from status/run) is
             // expected, not a surprise.
             collection.ensure_unlocked().map_err(Self::locked_error)?;
+
+            let existing = self.get_meta(secret)?;
+            let merged = existing.merge(update);
+
+            // `create_item(replace: true, ...)` only replaces an item whose
+            // FULL attribute set matches the one given here (verified: see
+            // Sessions/2026-09-21-platform-etiketi.md) — changing platform/
+            // note would otherwise leave a stale duplicate under the same
+            // service+name instead of updating it. Deleting first sidesteps
+            // that regardless of the exact matching rule.
+            for item in self.find(secret)? {
+                item.delete()
+                    .map_err(|e| Error::msg(format!("secret-service: {e}")))?;
+            }
+
+            let mut attrs = Self::search_attrs(secret);
+            if let Some(p) = merged.platform.as_deref() {
+                attrs.insert("platform", p);
+            }
+            if let Some(n) = merged.note.as_deref() {
+                attrs.insert("note", n);
+            }
             collection
                 .create_item(
                     &format!("maskrun: {secret}"),
-                    Self::search_attrs(secret),
+                    attrs,
                     value.as_bytes(),
                     true,
                     "text/plain",
@@ -213,17 +347,12 @@ pub mod linux {
         }
 
         fn get(&self, secret: &str) -> Result<Option<String>> {
-            self.unlock_all_collections()?;
-            let found = self
-                .ss
-                .search_items(Self::search_attrs(secret))
-                .map_err(|e| Error::msg(format!("secret-service: {e}")))?;
-            let item = match found.unlocked.first().or_else(|| found.locked.first()) {
-                Some(item) => item,
-                None => return Ok(None),
+            let items = self.find(secret)?;
+            let Some(item) = items.first() else {
+                return Ok(None);
             };
             // Belt and suspenders in case a provider still hands back a
-            // locked item despite the collection-wide unlock above.
+            // locked item despite the collection-wide unlock in find().
             if item.is_locked().unwrap_or(false) {
                 item.unlock().map_err(Self::locked_error)?;
             }
@@ -233,12 +362,47 @@ pub mod linux {
             Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
         }
 
-        fn delete(&self, secret: &str) -> Result<()> {
-            let found = self
-                .ss
-                .search_items(Self::search_attrs(secret))
+        fn get_meta(&self, secret: &str) -> Result<SecretMeta> {
+            let items = self.find(secret)?;
+            let Some(item) = items.first() else {
+                return Ok(SecretMeta::default());
+            };
+            let attrs = item
+                .get_attributes()
                 .map_err(|e| Error::msg(format!("secret-service: {e}")))?;
-            for item in found.unlocked.iter().chain(found.locked.iter()) {
+            Ok(Self::meta_from_attrs(&attrs))
+        }
+
+        fn set_meta(&self, secret: &str, update: &MetaUpdate) -> Result<()> {
+            let items = self.find(secret)?;
+            if items.is_empty() {
+                return Err(Error::msg(format!("no such secret: {secret}")));
+            }
+            let existing = Self::meta_from_attrs(
+                &items[0]
+                    .get_attributes()
+                    .map_err(|e| Error::msg(format!("secret-service: {e}")))?,
+            );
+            let merged = existing.merge(update);
+            let mut attrs = Self::search_attrs(secret);
+            if let Some(p) = merged.platform.as_deref() {
+                attrs.insert("platform", p);
+            }
+            if let Some(n) = merged.note.as_deref() {
+                attrs.insert("note", n);
+            }
+            // `Item.Attributes` is a D-Bus property: writing it replaces the
+            // whole map, so `service`/`name` are re-sent every time, not
+            // just the two fields that changed.
+            for item in &items {
+                item.set_attributes(attrs.clone())
+                    .map_err(|e| Error::msg(format!("secret-service: {e}")))?;
+            }
+            Ok(())
+        }
+
+        fn delete(&self, secret: &str) -> Result<()> {
+            for item in self.find(secret)? {
                 item.delete()
                     .map_err(|e| Error::msg(format!("secret-service: {e}")))?;
             }
@@ -246,22 +410,30 @@ pub mod linux {
         }
 
         fn list(&self) -> Result<Vec<String>> {
+            Ok(self
+                .list_meta()?
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect())
+        }
+
+        fn list_meta(&self) -> Result<Vec<(String, SecretMeta)>> {
             self.unlock_all_collections()?;
             let found = self
                 .ss
                 .search_items(HashMap::from([("service", SERVICE)]))
                 .map_err(|e| Error::msg(format!("secret-service: {e}")))?;
-            let mut names: Vec<String> = Vec::new();
+            let mut out: Vec<(String, SecretMeta)> = Vec::new();
             for item in found.unlocked.iter().chain(found.locked.iter()) {
                 if let Ok(attrs) = item.get_attributes() {
                     if let Some(name) = attrs.get("name") {
-                        names.push(name.clone());
+                        out.push((name.clone(), Self::meta_from_attrs(&attrs)));
                     }
                 }
             }
-            names.sort();
-            names.dedup();
-            Ok(names)
+            out.sort_by(|a, b| a.0.cmp(&b.0));
+            out.dedup_by(|a, b| a.0 == b.0);
+            Ok(out)
         }
 
         // put()/get()/list() don't pin to one collection, so there's no
@@ -278,17 +450,22 @@ pub mod linux {
 }
 
 // UNVERIFIED (no macOS machine — see Project.md). put/get/delete use
-// security-framework's `passwords` API, so the value never touches argv
-// (unlike the Python backend's `security -w VALUE`, briefly visible in `ps`
-// to this user). `list` still shells out to `security dump-keychain` (read-
-// only, prints no secret values): the crate has no service-scoped
+// security-framework's `passwords`/`item` APIs, so the value never touches
+// argv (unlike the Python backend's `security -w VALUE`, briefly visible in
+// `ps` to this user). `list` still shells out to `security dump-keychain`
+// (read-only, prints no secret values): the crate has no service-scoped
 // enumeration call at this level.
 #[cfg(target_os = "macos")]
 pub mod macos {
     use super::*;
+    use core_foundation::data::CFData;
+    use security_framework::item::{
+        update_item, ItemAddOptions, ItemAddValue, ItemClass, ItemSearchOptions, ItemUpdateOptions,
+        ItemUpdateValue,
+    };
     use security_framework::os::macos::keychain::SecKeychain;
     use security_framework::passwords::{
-        delete_generic_password, generic_password, set_generic_password, PasswordOptions,
+        delete_generic_password, generic_password, PasswordOptions,
     };
     use std::process::Command;
 
@@ -308,6 +485,15 @@ pub mod macos {
     impl KeychainBackend {
         pub fn new() -> Self {
             KeychainBackend
+        }
+
+        fn search(secret: &str) -> ItemSearchOptions {
+            let mut search = ItemSearchOptions::new();
+            search
+                .class(ItemClass::generic_password())
+                .service(SERVICE)
+                .account(secret);
+            search
         }
     }
 
@@ -337,10 +523,38 @@ pub mod macos {
             "keychain"
         }
 
-        fn put(&self, secret: &str, value: &str) -> Result<()> {
+        fn put(&self, secret: &str, value: &str, update: &MetaUpdate) -> Result<()> {
             unlock_default_keychain()?;
-            set_generic_password(SERVICE, secret, value.as_bytes())
-                .map_err(|e| Error::msg(format!("keychain: {e}")))
+            let existing = self.get_meta(secret)?;
+            let merged = existing.merge(update);
+            let comment = merged.note.as_deref().unwrap_or("");
+            let description = merged.platform.as_deref().unwrap_or("");
+
+            // Search params here carry only service+account, so this update
+            // matches the existing item regardless of what its comment/
+            // description used to be — unlike routing a changed attribute
+            // through `set_generic_password`, whose duplicate-item fallback
+            // re-searches using those same (new) attributes and would find
+            // nothing to update.
+            let mut upd = ItemUpdateOptions::new();
+            upd.set_value(ItemUpdateValue::Data(CFData::from_buffer(value.as_bytes())))
+                .set_comment(comment)
+                .set_description(description);
+            match update_item(&Self::search(secret), &upd) {
+                Ok(()) => Ok(()),
+                Err(e) if e.code() == ERR_SEC_ITEM_NOT_FOUND => {
+                    let mut add = ItemAddOptions::new(ItemAddValue::Data {
+                        class: ItemClass::generic_password(),
+                        data: CFData::from_buffer(value.as_bytes()),
+                    });
+                    add.set_service(SERVICE)
+                        .set_account_name(secret)
+                        .set_comment(comment)
+                        .set_description(description);
+                    add.add().map_err(|e| Error::msg(format!("keychain: {e}")))
+                }
+                Err(e) => Err(Error::msg(format!("keychain: {e}"))),
+            }
         }
 
         fn get(&self, secret: &str) -> Result<Option<String>> {
@@ -350,6 +564,37 @@ pub mod macos {
                 Err(e) if e.code() == ERR_SEC_ITEM_NOT_FOUND => Ok(None),
                 Err(e) => Err(Error::msg(format!("keychain: {e}"))),
             }
+        }
+
+        fn get_meta(&self, secret: &str) -> Result<SecretMeta> {
+            let mut search = Self::search(secret);
+            search.load_attributes(true).limit(1);
+            let results = match search.search() {
+                Ok(r) => r,
+                Err(e) if e.code() == ERR_SEC_ITEM_NOT_FOUND => return Ok(SecretMeta::default()),
+                Err(e) => return Err(Error::msg(format!("keychain: {e}"))),
+            };
+            let Some(dict) = results.iter().find_map(|r| r.simplify_dict()) else {
+                return Ok(SecretMeta::default());
+            };
+            let get = |k: &str| dict.get(k).filter(|s| !s.is_empty()).cloned();
+            Ok(SecretMeta {
+                platform: get("desc"),
+                note: get("icmt"),
+            })
+        }
+
+        fn set_meta(&self, secret: &str, update: &MetaUpdate) -> Result<()> {
+            if self.get(secret)?.is_none() {
+                return Err(Error::msg(format!("no such secret: {secret}")));
+            }
+            let existing = self.get_meta(secret)?;
+            let merged = existing.merge(update);
+            let mut upd = ItemUpdateOptions::new();
+            upd.set_comment(merged.note.as_deref().unwrap_or(""))
+                .set_description(merged.platform.as_deref().unwrap_or(""));
+            update_item(&Self::search(secret), &upd)
+                .map_err(|e| Error::msg(format!("keychain: {e}")))
         }
 
         fn delete(&self, secret: &str) -> Result<()> {
@@ -414,6 +659,71 @@ pub mod windows {
         s.encode_utf16().chain(std::iter::once(0)).collect()
     }
 
+    // Credential Manager has one freeform field (`Comment`) and no separate
+    // attribute store, so platform+note share it as `platform=P<US>note=N`.
+    // U+001F (Unit Separator) can't appear in either half: `check_name`
+    // forbids it in a platform label, and `check_note` rejects any control
+    // character in a note — so splitting on it back apart is unambiguous.
+    const META_SEP: char = '\u{1f}';
+
+    fn encode_meta(meta: &SecretMeta) -> String {
+        format!(
+            "platform={}{META_SEP}note={}",
+            meta.platform.as_deref().unwrap_or(""),
+            meta.note.as_deref().unwrap_or("")
+        )
+    }
+
+    fn decode_meta(comment: &str) -> SecretMeta {
+        let mut platform = None;
+        let mut note = None;
+        if let Some((p, n)) = comment.split_once(META_SEP) {
+            if let Some(p) = p.strip_prefix("platform=").filter(|s| !s.is_empty()) {
+                platform = Some(p.to_string());
+            }
+            if let Some(n) = n.strip_prefix("note=").filter(|s| !s.is_empty()) {
+                note = Some(n.to_string());
+            }
+        }
+        SecretMeta { platform, note }
+    }
+
+    struct RawCredential {
+        value: String,
+        meta: SecretMeta,
+    }
+
+    fn read_credential(secret: &str) -> Result<Option<RawCredential>> {
+        let target = target_name(secret);
+        unsafe {
+            let mut ptr: *mut CREDENTIALW = std::ptr::null_mut();
+            match CredReadW(
+                PWSTR(target.as_ptr() as *mut _),
+                CRED_TYPE_GENERIC,
+                None,
+                &mut ptr,
+            ) {
+                Ok(()) => {
+                    let cred = &*ptr;
+                    let bytes = std::slice::from_raw_parts(
+                        cred.CredentialBlob,
+                        cred.CredentialBlobSize as usize,
+                    );
+                    let value = String::from_utf8_lossy(bytes).into_owned();
+                    let meta = if cred.Comment.0.is_null() {
+                        SecretMeta::default()
+                    } else {
+                        decode_meta(&cred.Comment.to_string().unwrap_or_default())
+                    };
+                    CredFree(ptr as *mut _);
+                    Ok(Some(RawCredential { value, meta }))
+                }
+                Err(e) if e.code() == HRESULT::from_win32(ERROR_NOT_FOUND.0) => Ok(None),
+                Err(e) => Err(Error::msg(format!("credential manager: {e}"))),
+            }
+        }
+    }
+
     pub struct CredentialManagerBackend;
 
     impl Default for CredentialManagerBackend {
@@ -429,21 +739,26 @@ pub mod windows {
     }
 
     // Default is_locked() stands: Credential Manager has no lock concept,
-    // only the logged-in user session.
+    // only the logged-in user session. Default set_meta() stands too:
+    // CredWriteW always rewrites the whole entry, so relabelling has to read
+    // the value back regardless — there is no cheaper attribute-only call.
     impl Backend for CredentialManagerBackend {
         fn name(&self) -> &'static str {
             "dpapi"
         }
 
-        fn put(&self, secret: &str, value: &str) -> Result<()> {
+        fn put(&self, secret: &str, value: &str, update: &MetaUpdate) -> Result<()> {
+            let existing = self.get_meta(secret)?;
+            let merged = existing.merge(update);
             let mut target = target_name(secret);
             let mut username = wide(SERVICE);
             let mut blob = value.as_bytes().to_vec();
+            let mut comment = wide(&encode_meta(&merged));
             let credential = CREDENTIALW {
                 Flags: CRED_FLAGS(0),
                 Type: CRED_TYPE_GENERIC,
                 TargetName: PWSTR(target.as_mut_ptr()),
-                Comment: PWSTR::null(),
+                Comment: PWSTR(comment.as_mut_ptr()),
                 LastWritten: FILETIME::default(),
                 CredentialBlobSize: blob.len() as u32,
                 CredentialBlob: blob.as_mut_ptr(),
@@ -458,29 +773,11 @@ pub mod windows {
         }
 
         fn get(&self, secret: &str) -> Result<Option<String>> {
-            let target = target_name(secret);
-            unsafe {
-                let mut ptr: *mut CREDENTIALW = std::ptr::null_mut();
-                match CredReadW(
-                    PWSTR(target.as_ptr() as *mut _),
-                    CRED_TYPE_GENERIC,
-                    None,
-                    &mut ptr,
-                ) {
-                    Ok(()) => {
-                        let cred = &*ptr;
-                        let bytes = std::slice::from_raw_parts(
-                            cred.CredentialBlob,
-                            cred.CredentialBlobSize as usize,
-                        );
-                        let value = String::from_utf8_lossy(bytes).into_owned();
-                        CredFree(ptr as *mut _);
-                        Ok(Some(value))
-                    }
-                    Err(e) if e.code() == HRESULT::from_win32(ERROR_NOT_FOUND.0) => Ok(None),
-                    Err(e) => Err(Error::msg(format!("credential manager: {e}"))),
-                }
-            }
+            Ok(read_credential(secret)?.map(|c| c.value))
+        }
+
+        fn get_meta(&self, secret: &str) -> Result<SecretMeta> {
+            Ok(read_credential(secret)?.map(|c| c.meta).unwrap_or_default())
         }
 
         fn delete(&self, secret: &str) -> Result<()> {
@@ -496,6 +793,14 @@ pub mod windows {
         }
 
         fn list(&self) -> Result<Vec<String>> {
+            Ok(self
+                .list_meta()?
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect())
+        }
+
+        fn list_meta(&self) -> Result<Vec<(String, SecretMeta)>> {
             let filter = wide(&format!("{SERVICE}/*"));
             unsafe {
                 let mut count: u32 = 0;
@@ -511,19 +816,25 @@ pub mod windows {
                     }
                     Err(e) => return Err(Error::msg(format!("credential manager: {e}"))),
                 }
-                let mut names = Vec::new();
+                let mut out = Vec::new();
                 let entries = std::slice::from_raw_parts(ptr, count as usize);
                 for entry in entries {
                     let cred = &**entry;
                     let target = cred.TargetName.to_string().unwrap_or_default();
-                    if let Some(name) = target.strip_prefix(&format!("{SERVICE}/")) {
-                        names.push(name.to_string());
-                    }
+                    let Some(name) = target.strip_prefix(&format!("{SERVICE}/")) else {
+                        continue;
+                    };
+                    let meta = if cred.Comment.0.is_null() {
+                        SecretMeta::default()
+                    } else {
+                        decode_meta(&cred.Comment.to_string().unwrap_or_default())
+                    };
+                    out.push((name.to_string(), meta));
                 }
                 CredFree(ptr as *mut _);
-                names.sort();
-                names.dedup();
-                Ok(names)
+                out.sort_by(|a, b| a.0.cmp(&b.0));
+                out.dedup_by(|a, b| a.0 == b.0);
+                Ok(out)
             }
         }
     }
@@ -546,5 +857,59 @@ mod tests {
             locked.is_ok(),
             "is_locked() should report a state, not error: {locked:?}"
         );
+    }
+
+    #[test]
+    fn field_update_keep_resolves_to_existing() {
+        assert_eq!(
+            FieldUpdate::Keep.resolve(Some("x".into())),
+            Some("x".into())
+        );
+        assert_eq!(FieldUpdate::Keep.resolve(None), None);
+    }
+
+    #[test]
+    fn field_update_clear_resolves_to_none() {
+        assert_eq!(FieldUpdate::Clear.resolve(Some("x".into())), None);
+    }
+
+    #[test]
+    fn field_update_set_resolves_to_new_value() {
+        assert_eq!(
+            FieldUpdate::Set("y".into()).resolve(Some("x".into())),
+            Some("y".into())
+        );
+    }
+
+    #[test]
+    fn secret_meta_merge_keeps_untouched_fields() {
+        let existing = SecretMeta {
+            platform: Some("github".into()),
+            note: Some("old".into()),
+        };
+        let update = MetaUpdate {
+            platform: FieldUpdate::Keep,
+            note: FieldUpdate::Set("new".into()),
+        };
+        let merged = existing.merge(&update);
+        assert_eq!(merged.platform.as_deref(), Some("github"));
+        assert_eq!(merged.note.as_deref(), Some("new"));
+    }
+
+    #[test]
+    fn check_note_rejects_newline() {
+        assert!(check_note("line one\nline two").is_err());
+    }
+
+    #[test]
+    fn check_note_rejects_over_200_chars() {
+        let long = "a".repeat(201);
+        assert!(check_note(&long).is_err());
+    }
+
+    #[test]
+    fn check_note_accepts_200_chars() {
+        let ok = "a".repeat(200);
+        assert!(check_note(&ok).is_ok());
     }
 }

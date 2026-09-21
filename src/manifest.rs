@@ -158,7 +158,7 @@ pub fn cmd_import(
                 value.chars().count()
             );
         } else {
-            backend.put(secret, value)?;
+            backend.put(secret, value, &crate::keyring::MetaUpdate::default())?;
             println!("  stored {var:<28} -> {secret}");
         }
     }

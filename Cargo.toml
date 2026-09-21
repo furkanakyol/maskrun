@@ -9,6 +9,7 @@ default-run = "maskrun"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
+clap_complete = "4"
 regex = "1"
 serde = { version = "1", features = ["derive"] }
 # preserve_order: rewriting a user's settings.json (install-guard) must not reorder its keys.
@@ -26,6 +27,9 @@ dbus-secret-service = "4"
 # Security.framework's generic-password API — value never touches argv.
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework = "3"
+# Pinned to the minor version security-framework itself resolves to (see
+# Cargo.lock): CFData has to be the same type on both sides of the call.
+core-foundation = "0.10"
 
 # Credential Manager — see keyring.rs for why, replacing the Python DPAPI files.
 [target.'cfg(target_os = "windows")'.dependencies]

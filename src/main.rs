@@ -14,7 +14,7 @@ use clap::{Parser, Subcommand};
 use zeroize::Zeroizing;
 
 use error::{Error, Result};
-use keyring::Backend;
+use keyring::{Backend, FieldUpdate, MetaUpdate, SecretMeta};
 
 #[derive(Parser)]
 #[command(
@@ -23,11 +23,15 @@ use keyring::Backend;
     about = "Run commands with secrets from your OS keyring, without leaking them into an AI agent's context.",
     after_help = "examples:\n  \
         maskrun put myapp-database-url        store a secret (prompts, not echoed)\n  \
+        maskrun put                           fully interactive: asks name, platform, note, value\n  \
+        maskrun label gh-token --for github   tag an existing secret's platform\n  \
         maskrun import .env --dry-run         see what would move to the keyring\n  \
         maskrun status                        is every manifest entry present?\n  \
         maskrun run -- npm run dev            run with secrets injected, output masked\n  \
         maskrun exec API_KEY=my-key -- curl https://api.example.com\n  \
-        maskrun list                          names only, never values\n\n\
+        maskrun list                          grouped by platform, never values\n  \
+        maskrun list --plain                  flat names only, one per line, for scripts\n  \
+        maskrun completions fish > ~/.config/fish/completions/maskrun.fish\n\n\
         Output masking is automatic in an AI agent session and whenever stdout is not a\n\
         terminal. --raw turns it off, --mask forces it on."
 )]
@@ -38,18 +42,28 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    #[command(about = "store a secret in the keyring")]
+    #[command(about = "store a secret in the keyring (no args: asks for everything)")]
     Put {
-        name: String,
+        name: Option<String>,
         #[arg(long, help = "read the value from stdin instead of prompting")]
         stdin: bool,
+        #[arg(long = "for", help = "platform/service this secret belongs to")]
+        for_platform: Option<String>,
+        #[arg(long, help = "free-text note, one line, <=200 chars")]
+        note: Option<String>,
     },
     #[command(about = "print a secret (refused in an agent session)")]
     Get { name: String },
-    #[command(about = "list secret names (never values)")]
-    List,
-    #[command(about = "delete a secret")]
-    Rm { name: String },
+    #[command(about = "list secrets, grouped by platform (never values)")]
+    List {
+        #[arg(
+            long,
+            help = "flat sorted names, one per line — the old, script-facing format"
+        )]
+        plain: bool,
+    },
+    #[command(about = "delete a secret (no name: pick from a list, with confirmation)")]
+    Rm { name: Option<String> },
     #[command(about = "check the manifest against the keyring")]
     Status,
     #[command(about = "run a command with the manifest injected")]
@@ -87,6 +101,16 @@ enum Command {
         )]
         all: bool,
     },
+    #[command(about = "tag an existing secret's platform and/or note (no name: pick from a list)")]
+    Label {
+        name: Option<String>,
+        #[arg(long = "for", help = "platform/service label (\"\" clears it)")]
+        for_platform: Option<String>,
+        #[arg(long, help = "free-text note (\"\" clears it)")]
+        note: Option<String>,
+    },
+    #[command(about = "print a shell completion script")]
+    Completions { shell: clap_complete::Shell },
     #[command(about = "PreToolUse guard for agent harnesses (reads JSON on stdin)")]
     Hook,
     #[command(about = "add the guard hook to an agent harness's config")]
@@ -146,20 +170,8 @@ fn main() -> ExitCode {
     let cli = Cli::try_parse_from(&full_head).unwrap_or_else(|e| e.exit());
 
     let code = match cli.cmd {
-        None => {
-            use clap::CommandFactory;
-            Cli::command().print_help().ok();
-            println!();
-            1
-        }
-        Some(cmd) => match dispatch(cmd, tail) {
-            Ok(code) => code,
-            Err(Error::BrokenPipe) => 0,
-            Err(err) => {
-                eprintln!("maskrun: {err}");
-                1
-            }
-        },
+        None => exit_code(cmd_overview()),
+        Some(cmd) => exit_code(dispatch(cmd, tail)),
     };
 
     std::io::stdout().flush().ok();
@@ -167,17 +179,33 @@ fn main() -> ExitCode {
     ExitCode::from((code & 0xff) as u8)
 }
 
+fn exit_code(result: Result<i32>) -> i32 {
+    match result {
+        Ok(code) => code,
+        Err(Error::BrokenPipe) => 0,
+        Err(err) => {
+            eprintln!("maskrun: {err}");
+            1
+        }
+    }
+}
+
 fn dispatch(cmd: Command, tail: Vec<String>) -> Result<i32> {
     let backend: Option<Box<dyn Backend>> = match &cmd {
-        Command::Hook | Command::InstallGuard { .. } => None,
+        Command::Hook | Command::InstallGuard { .. } | Command::Completions { .. } => None,
         _ => Some(keyring::pick_backend()?),
     };
 
     match cmd {
-        Command::Put { name, stdin } => cmd_put(&name, stdin, backend.as_deref().unwrap()),
+        Command::Put {
+            name,
+            stdin,
+            for_platform,
+            note,
+        } => cmd_put(name, stdin, for_platform, note, backend.as_deref().unwrap()),
         Command::Get { name } => cmd_get(&name, backend.as_deref().unwrap()),
-        Command::List => cmd_list(backend.as_deref().unwrap()),
-        Command::Rm { name } => cmd_rm(&name, backend.as_deref().unwrap()),
+        Command::List { plain } => cmd_list(plain, backend.as_deref().unwrap()),
+        Command::Rm { name } => cmd_rm_interactive(name, backend.as_deref().unwrap()),
         Command::Status => cmd_status(backend.as_deref().unwrap()),
         Command::Run { raw, mask, command } => {
             let mut full_command = command;
@@ -212,6 +240,12 @@ fn dispatch(cmd: Command, tail: Vec<String>) -> Result<i32> {
             all,
             backend.as_deref().unwrap(),
         ),
+        Command::Label {
+            name,
+            for_platform,
+            note,
+        } => cmd_label(name, for_platform, note, backend.as_deref().unwrap()),
+        Command::Completions { shell } => cmd_completions(shell),
         Command::Hook => guard::cmd_hook(),
         Command::InstallGuard {
             harness,
@@ -229,8 +263,148 @@ fn dispatch(cmd: Command, tail: Vec<String>) -> Result<i32> {
     }
 }
 
-fn cmd_put(name: &str, from_stdin: bool, backend: &dyn Backend) -> Result<i32> {
-    let secret = keyring::check_name(name)?;
+// Both TTYs, not an AI agent driving the shell: prompts are only useful to a
+// human who can actually see and answer them. `--stdin`/non-interactive
+// callers never reach the functions that check this.
+fn interactive_stdio() -> bool {
+    std::io::stdin().is_terminal() && std::io::stdout().is_terminal() && !agent::in_agent()
+}
+
+fn prompt_line(prompt: &str) -> Result<Option<String>> {
+    print!("{prompt}");
+    std::io::stdout().flush().ok();
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    let trimmed = line.trim();
+    Ok(if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    })
+}
+
+// Shared by --for on `put`/`label` and by the interactive platform prompt:
+// absent -> leave alone, "" -> clear, anything else -> validate and set.
+fn platform_update(raw: Option<String>) -> Result<FieldUpdate> {
+    match raw {
+        None => Ok(FieldUpdate::Keep),
+        Some(s) if s.is_empty() => Ok(FieldUpdate::Clear),
+        Some(s) => Ok(FieldUpdate::Set(keyring::check_name(&s)?.to_string())),
+    }
+}
+
+fn note_update(raw: Option<String>) -> Result<FieldUpdate> {
+    match raw {
+        None => Ok(FieldUpdate::Keep),
+        Some(s) if s.is_empty() => Ok(FieldUpdate::Clear),
+        Some(s) => Ok(FieldUpdate::Set(keyring::check_note(&s)?.to_string())),
+    }
+}
+
+fn choose_secret(backend: &dyn Backend, verb: &str) -> Result<String> {
+    if !interactive_stdio() {
+        return Err(Error::msg(format!(
+            "secret name required. Usage: maskrun {verb} <name>"
+        )));
+    }
+    let names = backend.list()?;
+    if names.is_empty() {
+        return Err(Error::msg("no secrets stored"));
+    }
+    println!("secrets:");
+    for (i, n) in names.iter().enumerate() {
+        println!("  {}) {n}", i + 1);
+    }
+    let choice = prompt_line(&format!("{verb} which # : "))?
+        .ok_or_else(|| Error::msg("no selection, nothing done"))?;
+    let idx: usize = choice
+        .parse()
+        .map_err(|_| Error::msg(format!("not a number: {choice:?}")))?;
+    names
+        .into_iter()
+        .nth(idx.wrapping_sub(1))
+        .ok_or_else(|| Error::msg("out of range"))
+}
+
+fn prompt_platform_hint(backend: &dyn Backend) -> Result<Option<String>> {
+    if let Ok(entries) = backend.list_meta() {
+        let mut platforms: Vec<String> = entries
+            .into_iter()
+            .filter_map(|(_, meta)| meta.platform)
+            .collect();
+        platforms.sort();
+        platforms.dedup();
+        if !platforms.is_empty() {
+            println!("existing platforms: {}", platforms.join(", "));
+        }
+    }
+    prompt_line("Platform (Enter to skip): ")
+}
+
+fn prompt_value_confirmed(secret: &str) -> Result<Zeroizing<String>> {
+    loop {
+        let a = Zeroizing::new(
+            rpassword::prompt_password(format!("Value for {secret} (not echoed): "))
+                .map_err(|e| Error::msg(format!("could not read a password: {e}")))?,
+        );
+        if a.is_empty() {
+            return Err(Error::msg("empty value, nothing stored"));
+        }
+        let b = Zeroizing::new(
+            rpassword::prompt_password("Confirm (not echoed): ")
+                .map_err(|e| Error::msg(format!("could not read a password: {e}")))?,
+        );
+        if *a == *b {
+            return Ok(a);
+        }
+        eprintln!("maskrun: values did not match, try again.");
+    }
+}
+
+fn cmd_put(
+    name: Option<String>,
+    from_stdin: bool,
+    for_platform: Option<String>,
+    note: Option<String>,
+    backend: &dyn Backend,
+) -> Result<i32> {
+    let interactive = !from_stdin && interactive_stdio();
+
+    let name = match name {
+        Some(n) => n,
+        None if interactive => {
+            prompt_line("Secret name: ")?.ok_or_else(|| Error::msg("empty name, nothing stored"))?
+        }
+        None => {
+            return Err(Error::msg(
+                "secret name required. Usage: maskrun put <name>",
+            ))
+        }
+    };
+    let secret = keyring::check_name(&name)?.to_string();
+
+    if interactive && backend.get(&secret)?.is_some() {
+        println!(
+            "{secret} already exists — its value will be overwritten; its platform/note \
+             stay unless you set new ones below."
+        );
+    }
+
+    let for_platform = match for_platform {
+        Some(v) => Some(v),
+        None if interactive => prompt_platform_hint(backend)?,
+        None => None,
+    };
+    let note = match note {
+        Some(v) => Some(v),
+        None if interactive => prompt_line("Note (Enter to skip): ")?,
+        None => None,
+    };
+    let meta = MetaUpdate {
+        platform: platform_update(for_platform)?,
+        note: note_update(note)?,
+    };
+
     let value: Zeroizing<String> = if from_stdin {
         let mut buf = String::new();
         std::io::stdin().read_to_string(&mut buf)?;
@@ -238,6 +412,8 @@ fn cmd_put(name: &str, from_stdin: bool, backend: &dyn Backend) -> Result<i32> {
             buf.pop();
         }
         Zeroizing::new(buf)
+    } else if interactive {
+        prompt_value_confirmed(&secret)?
     } else {
         let prompt = format!("Value for {secret} (not echoed): ");
         let value = rpassword::prompt_password(prompt)
@@ -247,7 +423,8 @@ fn cmd_put(name: &str, from_stdin: bool, backend: &dyn Backend) -> Result<i32> {
         }
         Zeroizing::new(value)
     };
-    backend.put(secret, &value)?;
+
+    backend.put(&secret, &value, &meta)?;
     println!("stored: {secret}");
     Ok(0)
 }
@@ -271,16 +448,78 @@ fn cmd_get(name: &str, backend: &dyn Backend) -> Result<i32> {
     Ok(0)
 }
 
-fn cmd_list(backend: &dyn Backend) -> Result<i32> {
-    let names = backend.list()?;
-    if names.is_empty() {
+fn cmd_list(plain: bool, backend: &dyn Backend) -> Result<i32> {
+    if plain {
+        let names = backend.list()?;
+        if names.is_empty() {
+            println!("(no secrets stored)");
+            return Ok(0);
+        }
+        for name in names {
+            println!("{name}");
+        }
+        return Ok(0);
+    }
+
+    let mut entries = backend.list_meta()?;
+    if entries.is_empty() {
         println!("(no secrets stored)");
         return Ok(0);
     }
-    for name in names {
-        println!("{name}");
-    }
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    print_grouped(&entries);
     Ok(0)
+}
+
+// Platforms alphabetical, "(no platform)" last, names alphabetical within
+// each group (guaranteed by the caller pre-sorting `entries` by name).
+fn print_grouped(entries: &[(String, SecretMeta)]) {
+    use std::collections::BTreeMap;
+    let mut groups: BTreeMap<&str, Vec<&(String, SecretMeta)>> = BTreeMap::new();
+    let mut unlabelled: Vec<&(String, SecretMeta)> = Vec::new();
+    for entry in entries {
+        match entry.1.platform.as_deref() {
+            Some(p) => groups.entry(p).or_default().push(entry),
+            None => unlabelled.push(entry),
+        }
+    }
+    for (platform, items) in &groups {
+        println!("{platform}");
+        print_group_items(items);
+    }
+    if !unlabelled.is_empty() {
+        println!("(no platform)");
+        print_group_items(&unlabelled);
+    }
+}
+
+fn print_group_items(items: &[&(String, SecretMeta)]) {
+    let width = items
+        .iter()
+        .map(|(n, _)| n.chars().count())
+        .max()
+        .unwrap_or(0);
+    for (name, meta) in items {
+        match meta.note.as_deref() {
+            Some(note) => println!("  {name:<width$}   {note}"),
+            None => println!("  {name}"),
+        }
+    }
+}
+
+fn cmd_rm_interactive(name: Option<String>, backend: &dyn Backend) -> Result<i32> {
+    let (secret, needs_confirm) = match name {
+        Some(n) => (n, false),
+        None => (choose_secret(backend, "rm")?, true),
+    };
+    if needs_confirm {
+        let answer = prompt_line(&format!("delete '{secret}'? [y/N] "))?;
+        if !matches!(answer.as_deref(), Some("y" | "Y" | "yes" | "YES")) {
+            println!("cancelled");
+            return Ok(0);
+        }
+    }
+    cmd_rm(&secret, backend)
 }
 
 fn cmd_rm(name: &str, backend: &dyn Backend) -> Result<i32> {
@@ -293,6 +532,64 @@ fn cmd_rm(name: &str, backend: &dyn Backend) -> Result<i32> {
     Ok(0)
 }
 
+fn cmd_label(
+    name: Option<String>,
+    for_platform: Option<String>,
+    note: Option<String>,
+    backend: &dyn Backend,
+) -> Result<i32> {
+    let interactive = interactive_stdio();
+    let name = match name {
+        Some(n) => n,
+        None if interactive => choose_secret(backend, "label")?,
+        None => {
+            return Err(Error::msg(
+                "secret name required. Usage: maskrun label <name> [--for X] [--note Y]",
+            ))
+        }
+    };
+    let secret = keyring::check_name(&name)?.to_string();
+
+    let (for_platform, note) = if for_platform.is_none() && note.is_none() && interactive {
+        (
+            prompt_platform_hint(backend)?,
+            prompt_line("Note (Enter to skip): ")?,
+        )
+    } else {
+        (for_platform, note)
+    };
+
+    let platform = platform_update(for_platform)?;
+    let note = note_update(note)?;
+    if platform == FieldUpdate::Keep && note == FieldUpdate::Keep {
+        return Err(Error::msg(
+            "nothing to do: give --for, --note, or both (or answer at least one prompt)",
+        ));
+    }
+    backend.set_meta(&secret, &MetaUpdate { platform, note })?;
+    println!("labelled: {secret}");
+    Ok(0)
+}
+
+fn cmd_completions(shell: clap_complete::Shell) -> Result<i32> {
+    use clap::CommandFactory;
+    let mut cmd = Cli::command();
+    let name = cmd.get_name().to_string();
+    clap_complete::generate(shell, &mut cmd, name, &mut std::io::stdout());
+    // clap_complete only knows the static flag/subcommand surface. Completing
+    // an actual secret name means shelling back out to `maskrun list
+    // --plain`, which is exactly why that flag's output is frozen as one
+    // sorted name per line.
+    if shell == clap_complete::Shell::Fish {
+        print!("{FISH_DYNAMIC_COMPLETIONS}");
+    }
+    Ok(0)
+}
+
+const FISH_DYNAMIC_COMPLETIONS: &str = "
+complete -c maskrun -n '__fish_seen_subcommand_from get rm label' -f -a '(maskrun list --plain 2>/dev/null)'
+";
+
 fn cmd_status(backend: &dyn Backend) -> Result<i32> {
     let path = manifest::require_manifest()?;
     let pairs = manifest::read_manifest(&path)?;
@@ -302,7 +599,11 @@ fn cmd_status(backend: &dyn Backend) -> Result<i32> {
     for (var, secret) in &pairs {
         let present = matches!(backend.get(secret)?, Some(v) if !v.is_empty());
         let mark = if present { "ok     " } else { "MISSING" };
-        println!("  {mark} {var:<28} -> {secret}");
+        let platform = backend.get_meta(secret).unwrap_or_default().platform;
+        match platform {
+            Some(p) => println!("  {mark} {var:<28} -> {secret}  [{p}]"),
+            None => println!("  {mark} {var:<28} -> {secret}"),
+        }
         if !present {
             missing += 1;
         }
@@ -312,6 +613,70 @@ fn cmd_status(backend: &dyn Backend) -> Result<i32> {
         return Ok(1);
     }
     println!("\nall {} secret(s) present.", pairs.len());
+    Ok(0)
+}
+
+// Bare `maskrun`. Single branch point for the two cases: piped/CI output
+// (`maskrun | cat`, no tty) always gets the static summary below; an
+// arrow-key TUI (platform -> secret -> view/edit/delete) is meant to plug
+// into the `interactive_stdio()` arm here — everything it needs already
+// exists on `Backend::list_meta` (name+platform+note, no value read).
+// Branches are identical for now on purpose — the interactive arm is where
+// a future arrow-key TUI plugs in, in place of its `cmd_overview_summary()`.
+#[allow(clippy::if_same_then_else)]
+fn cmd_overview() -> Result<i32> {
+    if interactive_stdio() {
+        cmd_overview_summary()
+    } else {
+        cmd_overview_summary()
+    }
+}
+
+// An at-a-glance view instead of a help dump, so the command surface
+// doesn't have to live in the user's head.
+fn cmd_overview_summary() -> Result<i32> {
+    println!("maskrun — run commands with secrets from your OS keyring\n");
+
+    match keyring::pick_backend() {
+        Ok(backend) => {
+            match manifest::find_manifest(None) {
+                Ok(Some(path)) => match manifest::read_manifest(&path) {
+                    Ok(pairs) => {
+                        let missing = pairs
+                            .iter()
+                            .filter(
+                                |(_, s)| !matches!(backend.get(s), Ok(Some(v)) if !v.is_empty()),
+                            )
+                            .count();
+                        println!(
+                            "manifest: {} ({} secret(s), {missing} missing)",
+                            path.display(),
+                            pairs.len()
+                        );
+                    }
+                    Err(e) => println!("manifest: {} ({e})", path.display()),
+                },
+                _ => println!("no .maskrun manifest here (see: maskrun import <.env>)"),
+            }
+            println!();
+            match backend.list_meta() {
+                Ok(mut entries) if !entries.is_empty() => {
+                    entries.sort_by(|a, b| a.0.cmp(&b.0));
+                    println!("secrets ({}):", entries.len());
+                    print_grouped(&entries);
+                }
+                Ok(_) => println!("(no secrets stored)"),
+                Err(e) => println!("could not list secrets: {e}"),
+            }
+        }
+        Err(e) => println!("keyring backend not reachable: {e}"),
+    }
+
+    println!();
+    println!("next:");
+    println!("  maskrun put <name>          store a secret");
+    println!("  maskrun run -- <command>    run with the manifest injected");
+    println!("  maskrun --help              full command reference");
     Ok(0)
 }
 
@@ -389,5 +754,28 @@ mod tests {
                 .map(String::from)
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn platform_update_absent_keeps() {
+        assert_eq!(platform_update(None).unwrap(), FieldUpdate::Keep);
+    }
+
+    #[test]
+    fn platform_update_empty_clears() {
+        assert_eq!(
+            platform_update(Some(String::new())).unwrap(),
+            FieldUpdate::Clear
+        );
+    }
+
+    #[test]
+    fn platform_update_validates_charset() {
+        assert!(platform_update(Some("has space".to_string())).is_err());
+    }
+
+    #[test]
+    fn note_update_rejects_newline() {
+        assert!(note_update(Some("a\nb".to_string())).is_err());
     }
 }
