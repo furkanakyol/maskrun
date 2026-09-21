@@ -10,7 +10,10 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use crossterm::cursor::{Hide, MoveTo, Show};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers,
+};
 use crossterm::style::{Attribute, Print, SetAttribute};
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, size, Clear, ClearType, EnterAlternateScreen,
@@ -651,7 +654,12 @@ struct TerminalGuard;
 impl TerminalGuard {
     fn enter() -> Result<Self> {
         enable_raw_mode().map_err(|e| Error::msg(format!("could not enter raw mode: {e}")))?;
-        if let Err(e) = execute!(std::io::stdout(), EnterAlternateScreen, Hide) {
+        if let Err(e) = execute!(
+            std::io::stdout(),
+            EnterAlternateScreen,
+            Hide,
+            EnableBracketedPaste
+        ) {
             let _ = disable_raw_mode();
             return Err(Error::msg(format!(
                 "could not enter the alternate screen: {e}"
@@ -668,7 +676,12 @@ impl Drop for TerminalGuard {
 }
 
 fn restore_terminal() {
-    let _ = execute!(std::io::stdout(), Show, LeaveAlternateScreen);
+    let _ = execute!(
+        std::io::stdout(),
+        DisableBracketedPaste,
+        Show,
+        LeaveAlternateScreen
+    );
     let _ = disable_raw_mode();
 }
 
@@ -806,6 +819,7 @@ struct AddForm {
     value: Zeroizing<String>,
     confirm: Zeroizing<String>,
     error: Option<String>,
+    reveal: bool,
 }
 
 impl AddForm {
@@ -818,6 +832,7 @@ impl AddForm {
             value: Zeroizing::new(String::new()),
             confirm: Zeroizing::new(String::new()),
             error: None,
+            reveal: false,
         }
     }
 
@@ -828,6 +843,22 @@ impl AddForm {
             AddField::Note => self.note.push(c),
             AddField::Value => self.value.push(c),
             AddField::Confirm => self.confirm.push(c),
+        }
+    }
+
+    // A pasted secret arrives as one Paste event, so it lands in the field
+    // whole. Without this, a token copied with its trailing newline sent that
+    // newline through as Enter and moved the cursor to the next field
+    // mid-paste, leaving the user typing into `confirm` believing they were
+    // still entering the value.
+    fn push_paste(&mut self, text: &str) {
+        let cleaned: String = text.chars().filter(|c| !c.is_control()).collect();
+        match self.field {
+            AddField::Name => self.name.push_str(&cleaned),
+            AddField::Platform => self.platform.push_str(&cleaned),
+            AddField::Note => self.note.push_str(&cleaned),
+            AddField::Value => self.value.push_str(&cleaned),
+            AddField::Confirm => self.confirm.push_str(&cleaned),
         }
     }
 
@@ -950,14 +981,21 @@ fn render_add_form(form: &AddForm, platforms: &[String], cols: usize) -> Vec<Str
         format!("   existing: {}", platforms.join(", "))
     });
     lines.push(field_line("note", &form.note, form.field == AddField::Note));
+    let shown = |v: &Zeroizing<String>| {
+        if form.reveal {
+            v.to_string()
+        } else {
+            masked(v)
+        }
+    };
     lines.push(field_line(
         "value",
-        &masked(&form.value),
+        &shown(&form.value),
         form.field == AddField::Value,
     ));
     lines.push(field_line(
         "confirm",
-        &masked(&form.confirm),
+        &shown(&form.confirm),
         form.field == AddField::Confirm,
     ));
 
@@ -966,7 +1004,7 @@ fn render_add_form(form: &AddForm, platforms: &[String], cols: usize) -> Vec<Str
         Some(e) => format!(" ! {e}"),
         None => String::new(),
     });
-    lines.push(" Enter/Tab next   Shift-Tab back   Esc cancel".to_string());
+    lines.push(" Enter/Tab next   Shift-Tab back   ^R reveal   Esc cancel".to_string());
 
     lines
         .into_iter()
@@ -1002,18 +1040,26 @@ fn run_add_form(app: &mut App, backend: &dyn Backend) -> Result<()> {
         let (cols, rows) = size().unwrap_or((MIN_COLS, MIN_ROWS));
         draw_add_form(&mut std::io::stdout(), &form, &platforms, cols, rows)?;
 
-        let Event::Key(KeyEvent {
-            code,
-            kind: KeyEventKind::Press,
-            modifiers,
-            ..
-        }) = event::read()?
-        else {
-            continue;
+        let (code, modifiers) = match event::read()? {
+            Event::Paste(text) => {
+                form.push_paste(&text);
+                continue;
+            }
+            Event::Key(KeyEvent {
+                code,
+                kind: KeyEventKind::Press,
+                modifiers,
+                ..
+            }) => (code, modifiers),
+            _ => continue,
         };
 
         if modifiers.contains(KeyModifiers::CONTROL) && code == KeyCode::Char('c') {
             return Ok(());
+        }
+        if modifiers.contains(KeyModifiers::CONTROL) && code == KeyCode::Char('r') {
+            form.reveal = !form.reveal;
+            continue;
         }
 
         match code {
@@ -1753,6 +1799,27 @@ mod tests {
         form.back();
         assert_eq!(form.field, AddField::Platform);
         assert!(form.error.is_none());
+    }
+
+    #[test]
+    fn a_pasted_value_keeps_its_field_even_with_a_trailing_newline() {
+        let mut form = AddForm::new();
+        form.field = AddField::Value;
+        form.push_paste("ghp_token_with_newline\n");
+        assert_eq!(form.field, AddField::Value);
+        assert_eq!(&*form.value, "ghp_token_with_newline");
+    }
+
+    #[test]
+    fn revealing_shows_the_value_and_masking_hides_it() {
+        let mut form = AddForm::new();
+        form.field = AddField::Value;
+        form.push_paste("plain-token");
+        let hidden = render_add_form(&form, &[], 80).join("\n");
+        assert!(!hidden.contains("plain-token"));
+        form.reveal = true;
+        let shown = render_add_form(&form, &[], 80).join("\n");
+        assert!(shown.contains("plain-token"));
     }
 
     #[test]
