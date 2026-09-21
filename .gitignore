@@ -1,0 +1,8 @@
+.maskrun
+.env
+.env.*
+!.env.example
+*.maskrun-backup
+
+# Rust
+/target

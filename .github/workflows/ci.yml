@@ -1,0 +1,158 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  linux:
+    name: linux
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Install Secret Service
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libsecret-tools gnome-keyring dbus-x11
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      # --test-threads=1: measured, not assumed — under parallel load this
+      # runner's D-Bus/secret-service setup occasionally drops a connection;
+      # serial runs have gone through cleanly dozens of times in a row.
+      # MASKRUN_REQUIRE_KEYRING=1 turns a silently-skipped backend into a
+      # hard failure, so a green run here always means the keyring tests
+      # actually ran against a live Secret Service.
+      - name: Test
+        env:
+          MASKRUN_REQUIRE_KEYRING: "1"
+        run: |
+          dbus-run-session -- bash -c '
+            set -u
+            printf "\n" | gnome-keyring-daemon --unlock --components=secrets >/dev/null 2>&1 || true
+            for _ in $(seq 1 30); do
+              if printf "warmup" | secret-tool store --label=ci service maskrun-ci name warmup 2>/dev/null; then
+                secret-tool clear service maskrun-ci name warmup 2>/dev/null || true
+                break
+              fi
+              sleep 1
+            done
+            cargo test -- --test-threads=1
+          '
+
+  macos:
+    name: macos · keychain
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Create a disposable keychain
+        run: |
+          security create-keychain -p "" maskrun-ci.keychain
+          security default-keychain -s maskrun-ci.keychain
+          security unlock-keychain -p "" maskrun-ci.keychain
+          # no auto-lock: a locked keychain mid-run would prompt and hang
+          security set-keychain-settings maskrun-ci.keychain
+
+      - name: Test
+        env:
+          MASKRUN_REQUIRE_KEYRING: "1"
+        run: cargo test -- --test-threads=1
+
+  windows:
+    name: windows · dpapi
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      # DPAPI needs no service, so this needs no setup at all.
+      - name: Test
+        env:
+          MASKRUN_REQUIRE_KEYRING: "1"
+        run: cargo test -- --test-threads=1
+
+  no-keyring:
+    name: linux · no keyring (guard still works)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build
+        run: cargo build --release
+
+      # The README promises the guard works with no keyring present, e.g. in a
+      # bare container. This job is what keeps that promise honest: no
+      # secret-service packages are installed above, and no
+      # MASKRUN_REQUIRE_KEYRING is set, so the suite's own backend-reachable
+      # checks must all skip cleanly rather than fail.
+      - name: Test without a backend
+        run: cargo test -- --test-threads=1
+
+      - name: Guard must answer without a keyring
+        run: |
+          echo '{"tool_name":"Bash","tool_input":{"command":"maskrun get x"}}' \
+            | target/release/maskrun hook | grep -q '"deny"'
+          echo '{"tool_name":"Bash","tool_input":{"command":"maskrun status"}}' \
+            | target/release/maskrun hook | wc -c | grep -qx '0'
+
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: cargo fmt --check
+        run: cargo fmt --check
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Shell lint
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq shellcheck
+          shellcheck --shell=sh install.sh
+
+      - name: PowerShell lint
+        shell: pwsh
+        run: |
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+            "$PWD/install.ps1", [ref]$null, [ref]$errors) | Out-Null
+          if ($errors) { $errors | ForEach-Object { Write-Error $_ }; exit 1 }
+          Write-Host "install.ps1 parses cleanly"
+
+  msrv:
+    name: msrv
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Read from Cargo.toml instead of hardcoding it a second time here —
+      # a bumped rust-version should not also require remembering to edit
+      # this workflow.
+      - id: msrv
+        run: |
+          version=$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+      - name: Build at MSRV
+        run: cargo build --locked
