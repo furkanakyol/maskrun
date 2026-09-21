@@ -390,6 +390,8 @@ BLOCK = [
     ("source .env", "Bash", "command", "source .env && npm run dev"),
     ("cat .envrc", "Bash", "command", "cat .envrc"),
     ("grep on .env", "Bash", "command", "grep DATABASE .env"),
+    ("grep -E with a pattern then .env", "Bash", "command", "grep -E 'DB|KEY' .env"),
+    ("awk over .env", "Bash", "command", "awk '{print $1}' .env"),
     ("diff .env", "Bash", "command", "diff .env .env.example"),
     ("cat redirected from .env", "Bash", "command", "cat < .env"),
     ("sed on .env", "Bash", "command", "sed -n 1,5p .env"),
@@ -431,6 +433,12 @@ ALLOW = [
      'echo "secrets live in the keyring, not .env" | head -3'),
     (".env in prose piped to grep", "Bash", "command",
      'echo "look at .env someday" | grep -o env'),
+    # Found by dogfooding: ".env" as a search PATTERN, not a file to read.
+    ("ls piped to grep -E for .env", "Bash", "command", 'ls -la | grep -E "\\.env"'),
+    ("ls piped to plain grep .env", "Bash", "command", "ls -la | grep '\\.env'"),
+    ("rg searching for the text .env", "Bash", "command", "rg .env"),
+    ("grep -r for .env across the tree", "Bash", "command", "grep -rn .env src/"),
+    ("wc counts lines without printing them", "Bash", "command", "wc -l .env"),
     ("Read .env.example", "Read", "file_path", "/home/x/proj/.env.example"),
     ("Read .maskrun", "Read", "file_path", "/home/x/proj/.maskrun"),
     ("Read source file", "Read", "file_path", "/home/x/proj/src/index.ts"),
@@ -510,6 +518,12 @@ class TestUnits(unittest.TestCase):
         command = "cat <<'EOF' > f\nsecret .env line\nEOF\nls"
         self.assertNotIn("secret .env line", mr.strip_heredocs(command))
         self.assertIn("ls", mr.strip_heredocs(command))
+
+    def test_drop_pattern_argument(self):
+        # grep -E "\.env"  ->  no file arguments left
+        self.assertEqual(mr.drop_pattern_argument(["-E", "\\.env"]), [])
+        # grep DATABASE .env  ->  .env survives as a file argument
+        self.assertEqual(mr.drop_pattern_argument(["DATABASE", ".env"]), [".env"])
 
     def test_segment_command_skips_env_prefix_and_sudo(self):
         self.assertEqual(mr.segment_command(["FOO=1", "sudo", "cat", "x"]), "cat")

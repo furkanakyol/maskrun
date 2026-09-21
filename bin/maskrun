@@ -751,6 +751,10 @@ READERS = {
     "grep", "egrep", "fgrep", "rg", "ag", "sed", "awk", "cut", "diff",
     "type", "gc",  # PowerShell aliases for Get-Content
 }
+# Readers whose FIRST positional argument is a pattern or script, not a file.
+# Without this, `ls -la | grep -E "\.env"` looked like reading a .env when the
+# ".env" was only the thing being searched for.
+PATTERN_READERS = {"grep", "egrep", "fgrep", "rg", "ag", "sed", "awk"}
 SEPARATORS = {"|", "||", "&&", ";", "&", "|&"}
 ENV_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 HEREDOC_RE = re.compile(r"<<-?\s*(['\"]?)(\w+)\1")
@@ -835,12 +839,34 @@ def segment_command(segment):
     return ""
 
 
+def drop_pattern_argument(args):
+    """Remove a pattern-taking reader's first positional argument.
+
+    `grep -E "\\.env"` searches FOR the text ".env"; it does not read a file
+    called that. Options are skipped on the way to the pattern.
+    """
+    remaining = []
+    dropped = False
+    for word in args:
+        if not dropped:
+            if word.startswith("-"):
+                continue      # an option, not the pattern
+            dropped = True    # this word is the pattern itself
+            continue
+        remaining.append(word)
+    return remaining
+
+
 def reads_env_file(command):
     """Is a secret-bearing .env actually being READ here?"""
     for segment in pipeline_segments(command):
-        if segment_command(segment) not in READERS:
+        name = segment_command(segment)
+        if name not in READERS:
             continue
-        for word in segment[1:]:
+        args = segment[1:]
+        if name in PATTERN_READERS:
+            args = drop_pattern_argument(args)
+        for word in args:
             for path in ENV_PATH_RE.findall(word):
                 if path and not HARMLESS_ENV.search(path):
                     return (
