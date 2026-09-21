@@ -5,3 +5,6 @@ __pycache__/
 .env.*
 !.env.example
 *.maskrun-backup
+
+# Rust
+/target

@@ -1,0 +1,250 @@
+// Port of test/test_maskrun.py's TestKeyring class, against the compiled
+// binary. Secret values are randomly generated and never printed —
+// assertions compare fingerprints or check absence/presence, not the value.
+
+use std::hash::{Hash, Hasher};
+use std::io::Write;
+use std::process::{Command, Output, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
+
+fn unique_suffix() -> String {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    nanos.hash(&mut hasher);
+    std::process::id().hash(&mut hasher);
+    n.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+fn random_value() -> String {
+    format!("v-{}-{}", unique_suffix(), unique_suffix())
+}
+
+// FNV-1a: not cryptographic, but this only needs to catch "changed vs.
+// unchanged", so it's not worth a sha2 dev-dependency.
+fn fingerprint(data: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for &b in data {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+fn run(args: &[&str], env_extra: &[(&str, &str)], stdin_data: Option<&[u8]>) -> Output {
+    run_in(None, args, env_extra, stdin_data)
+}
+
+fn run_in(
+    cwd: Option<&std::path::Path>,
+    args: &[&str],
+    env_extra: &[(&str, &str)],
+    stdin_data: Option<&[u8]>,
+) -> Output {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_maskrun"));
+    cmd.args(args);
+    // Unset: these leak in from a session like this one and change get/refuse_in_agent.
+    for var in [
+        "MASKRUN_AGENT",
+        "CLAUDECODE",
+        "CLAUDE_CODE_ENTRYPOINT",
+        "AI_AGENT",
+        "AIDER_CHAT",
+        "CURSOR_AGENT",
+        "OPENAI_CODEX",
+        "GEMINI_CLI",
+        "REPLIT_AGENT",
+        "MASKRUN_MASK",
+        "MASKRUN_ALLOW_READ",
+    ] {
+        cmd.env_remove(var);
+    }
+    for (k, v) in env_extra {
+        cmd.env(k, v);
+    }
+    if let Some(dir) = cwd {
+        cmd.current_dir(dir);
+    }
+    cmd.stdin(Stdio::piped());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    let mut child = cmd.spawn().expect("failed to spawn maskrun binary");
+    match stdin_data {
+        Some(data) => child.stdin.take().unwrap().write_all(data).unwrap(),
+        None => drop(child.stdin.take()),
+    }
+    child.wait_with_output().expect("failed to wait on maskrun")
+}
+
+fn keyring_probe_available() -> bool {
+    let probe = format!("maskrun-selftest-probe-{}", unique_suffix());
+    let put = run(&["put", &probe, "--stdin"], &[], Some(b"probe-value-long-enough"));
+    if !put.status.success() {
+        return false;
+    }
+    let got = run(&["get", &probe], &[("MASKRUN_ALLOW_READ", "1")], None);
+    let _ = run(&["rm", &probe], &[], None);
+    got.status.success() && String::from_utf8_lossy(&got.stdout).contains("probe-value-long-enough")
+}
+
+// Python's `--require-keyring`, as an env var: no reachable backend prints
+// why and skips, unless MASKRUN_REQUIRE_KEYRING=1 makes that a hard failure.
+fn require_keyring() -> bool {
+    static AVAILABLE: OnceLock<bool> = OnceLock::new();
+    let available = *AVAILABLE.get_or_init(keyring_probe_available);
+    if !available {
+        if std::env::var("MASKRUN_REQUIRE_KEYRING").as_deref() == Ok("1") {
+            panic!("MASKRUN_REQUIRE_KEYRING=1 but no keyring backend is reachable");
+        }
+        eprintln!("skipping: no reachable keyring backend on this machine");
+    }
+    available
+}
+
+struct StoredSecret {
+    name: String,
+}
+
+impl Drop for StoredSecret {
+    fn drop(&mut self) {
+        let _ = run(&["rm", &self.name], &[], None);
+    }
+}
+
+fn store(value: &[u8]) -> StoredSecret {
+    let name = format!("maskrun-test-{}", unique_suffix());
+    let out = run(&["put", &name, "--stdin"], &[], Some(value));
+    assert!(
+        out.status.success(),
+        "put failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    StoredSecret { name }
+}
+
+#[test]
+fn keyring_roundtrip_preserves_awkward_values() {
+    if !require_keyring() {
+        return;
+    }
+    let cases: [(&str, String); 6] = [
+        ("url with = in query", "postgres://u:p@h:5432/db?opt=a=b&x=1".to_string()),
+        ("double quoted", "value \"with\" quotes".to_string()),
+        ("single quoted", "value 'with' quotes".to_string()),
+        ("spaces", "a value with spaces".to_string()),
+        ("unicode", "parola-çöğüş-éè".to_string()),
+        ("trailing equals", "abcdefgh==".to_string()),
+    ];
+    for (label, value) in cases {
+        let secret = store(value.as_bytes());
+        let got = run(&["get", &secret.name], &[("MASKRUN_ALLOW_READ", "1")], None);
+        assert!(got.status.success(), "{label}: {}", String::from_utf8_lossy(&got.stderr));
+        let returned = String::from_utf8_lossy(&got.stdout);
+        let returned = returned.strip_suffix('\n').unwrap_or(&returned);
+        assert_eq!(
+            fingerprint(returned.as_bytes()),
+            fingerprint(value.as_bytes()),
+            "{label} did not round-trip byte-for-byte"
+        );
+    }
+}
+
+#[test]
+fn keyring_list_shows_name_not_value() {
+    if !require_keyring() {
+        return;
+    }
+    let value = random_value();
+    let secret = store(value.as_bytes());
+    let listed = run(&["list"], &[], None);
+    assert!(listed.status.success());
+    let out = String::from_utf8_lossy(&listed.stdout);
+    assert!(out.contains(&secret.name));
+    assert!(!out.contains(&value));
+}
+
+#[test]
+fn keyring_rm_removes() {
+    if !require_keyring() {
+        return;
+    }
+    let name = format!("maskrun-test-{}", unique_suffix());
+    let put = run(&["put", &name, "--stdin"], &[], Some(random_value().as_bytes()));
+    assert!(put.status.success());
+    let rm = run(&["rm", &name], &[], None);
+    assert!(rm.status.success());
+    let gone = run(&["get", &name], &[("MASKRUN_ALLOW_READ", "1")], None);
+    assert!(!gone.status.success());
+}
+
+#[test]
+fn keyring_get_missing_fails() {
+    if !require_keyring() {
+        return;
+    }
+    let name = format!("maskrun-definitely-absent-{}", unique_suffix());
+    let result = run(&["get", &name], &[("MASKRUN_ALLOW_READ", "1")], None);
+    assert!(!result.status.success());
+}
+
+#[test]
+fn invalid_name_rejected() {
+    for bad in ["has space", "has/slash", "-leading-dash", ""] {
+        let result = run(&["get", bad], &[("MASKRUN_ALLOW_READ", "1")], None);
+        assert!(!result.status.success(), "should have been rejected: {bad:?}");
+    }
+}
+
+#[test]
+fn status_reports_ok_and_missing() {
+    if !require_keyring() {
+        return;
+    }
+    let value = random_value();
+    let secret = store(value.as_bytes());
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join(".maskrun"), format!("TEST={}\n", secret.name)).unwrap();
+
+    let ok = run_in(Some(dir.path()), &["status"], &[], None);
+    assert!(ok.status.success(), "{}", String::from_utf8_lossy(&ok.stderr));
+    assert!(String::from_utf8_lossy(&ok.stdout).contains("ok"));
+
+    std::fs::write(
+        dir.path().join(".maskrun"),
+        format!("TEST={}\nOTHER=maskrun-absent-{}\n", secret.name, unique_suffix()),
+    )
+    .unwrap();
+    let missing = run_in(Some(dir.path()), &["status"], &[], None);
+    assert_eq!(missing.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&missing.stdout).contains("MISSING"));
+}
+
+#[test]
+fn version_and_help_exit_cleanly() {
+    let version = run(&["--version"], &[], None);
+    assert!(version.status.success());
+    assert!(String::from_utf8_lossy(&version.stdout).contains("maskrun"));
+
+    let help = run(&["--help"], &[], None);
+    assert!(help.status.success());
+}
+
+#[test]
+fn double_dash_argv_split_reaches_stub_command() {
+    // Reaching "not yet implemented" (not the "not a VAR=secret-name pair"
+    // error) proves the split before -- was right despite exec being a stub.
+    let result = run(&["exec", "FOO=x", "--", "echo", "hi"], &[], None);
+    assert_eq!(result.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&result.stderr).contains("not yet implemented"));
+
+    // Only the first -- splits; a second -- stays part of the command.
+    let result = run(&["run", "--", "echo", "--", "--flag"], &[], None);
+    assert_eq!(result.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&result.stderr).contains("not yet implemented"));
+}

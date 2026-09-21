@@ -1,0 +1,42 @@
+[package]
+name = "maskrun"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Run commands with secrets from your OS keyring, without leaking them into an AI agent's context."
+license = "MIT"
+default-run = "maskrun"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+# preserve_order: rewriting a user's settings.json (install-guard) must not reorder its keys.
+serde_json = { version = "1", features = ["preserve_order"] }
+base64 = "0.23"
+percent-encoding = "2"
+zeroize = "1"
+rpassword = "7"
+
+# Not `keyring`: its Secret Service store uses service+username, not
+# service+name (see keyring.rs). Plain, not Dh, skips a ~30-crate DH stack.
+[target.'cfg(target_os = "linux")'.dependencies]
+dbus-secret-service = "4"
+
+# Security.framework's generic-password API — value never touches argv.
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "3"
+
+# Credential Manager — see keyring.rs for why, replacing the Python DPAPI files.
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.62", features = ["Win32_Security_Credentials", "Win32_Foundation"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+strip = true
+lto = true
+opt-level = "z"
+codegen-units = 1
+panic = "abort"
