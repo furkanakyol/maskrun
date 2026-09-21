@@ -1,0 +1,1151 @@
+#!/usr/bin/env python3
+"""maskrun — run commands with secrets from your OS keyring, without ever
+letting the values reach an AI agent's context.
+
+Design principle: INJECTION, NOT READING.
+
+Secrets live in the operating system's keyring. A repository holds only a
+`.maskrun` manifest of `VAR=secret-name` lines, which contains no secrets and
+can be committed. `maskrun run` hands the values to one child process and
+nothing else.
+
+That alone is not enough when an AI coding agent drives the shell. Injection
+stops the agent reading the vault; it does not stop the value coming back out
+of the process on stdout. So maskrun adds two things:
+
+  1. Output redaction. The child's stdout/stderr pass through a filter that
+     replaces secret values with <masked:VAR>.
+  2. A guard for agent harnesses (`maskrun hook`) that refuses the commands
+     which would put a value into the transcript in the first place.
+
+This hardens against ACCIDENTS, not against a determined attacker. See the
+"What this is not" section of the README.
+
+Single file on purpose: one download, no build step, same code on Linux,
+macOS and Windows. Targets Python 3.9+.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import json
+import os
+import platform
+import re
+import shlex
+import subprocess
+import sys
+import threading
+import urllib.parse
+
+__version__ = "0.1.0"
+
+SERVICE = "maskrun"          # keyring service/collection name
+MANIFEST = ".maskrun"        # per-project manifest filename
+MIN_MASK_LEN = 6             # shorter values are never masked (see mask_specs)
+TAIL_HOLD = 512              # bytes held back to catch a value split mid-write
+
+NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+class MaskrunError(Exception):
+    """A user-facing error. main() prints it and exits non-zero."""
+
+
+# --------------------------------------------------------------------------
+# Keyring backends
+# --------------------------------------------------------------------------
+
+def _run(argv, stdin_data=None, check=True):
+    try:
+        proc = subprocess.run(
+            argv,
+            input=stdin_data,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except FileNotFoundError:
+        raise MaskrunError(
+            "%s not found. %s" % (argv[0], _missing_tool_hint(argv[0]))
+        )
+    if check and proc.returncode != 0:
+        raise MaskrunError(
+            "%s failed (exit %d): %s"
+            % (argv[0], proc.returncode, proc.stderr.decode("utf-8", "replace").strip())
+        )
+    return proc
+
+
+def _missing_tool_hint(tool):
+    hints = {
+        "secret-tool": (
+            "Install libsecret's CLI: Debian/Ubuntu 'apt install libsecret-tools', "
+            "Fedora 'dnf install libsecret', Arch 'pacman -S libsecret'. "
+            "A running Secret Service (gnome-keyring or KeePassXC) is also required."
+        ),
+        "security": "This is macOS's built-in keychain tool; it should be at /usr/bin/security.",
+    }
+    return hints.get(tool, "")
+
+
+class SecretServiceBackend:
+    """Linux: libsecret / Secret Service via the `secret-tool` CLI."""
+
+    name = "secret-service"
+
+    def put(self, secret, value):
+        _run(
+            ["secret-tool", "store", "--label=maskrun: %s" % secret,
+             "service", SERVICE, "name", secret],
+            stdin_data=value.encode(),
+        )
+
+    def get(self, secret):
+        proc = _run(
+            ["secret-tool", "lookup", "service", SERVICE, "name", secret],
+            check=False,
+        )
+        if proc.returncode != 0:
+            return None
+        return proc.stdout.decode("utf-8")
+
+    def delete(self, secret):
+        _run(["secret-tool", "clear", "service", SERVICE, "name", secret])
+
+    def list(self):
+        # secret-tool writes attribute lines to stderr; values are not printed.
+        proc = _run(["secret-tool", "search", "--all", "service", SERVICE], check=False)
+        blob = (proc.stdout + proc.stderr).decode("utf-8", "replace")
+        found = re.findall(r"^attribute\.name = (.*)$", blob, re.M)
+        return sorted(set(n.strip() for n in found if n.strip()))
+
+
+class KeychainBackend:
+    """macOS: the login keychain via the built-in `security` CLI."""
+
+    name = "keychain"
+
+    def put(self, secret, value):
+        # -U updates an existing item instead of erroring.
+        _run(["security", "add-generic-password", "-U",
+              "-s", SERVICE, "-a", secret, "-w", value])
+
+    def get(self, secret):
+        proc = _run(["security", "find-generic-password",
+                     "-s", SERVICE, "-a", secret, "-w"], check=False)
+        if proc.returncode != 0:
+            return None
+        # `security -w` appends a newline of its own.
+        return proc.stdout.decode("utf-8").rstrip("\n")
+
+    def delete(self, secret):
+        _run(["security", "delete-generic-password", "-s", SERVICE, "-a", secret])
+
+    def list(self):
+        # dump-keychain prints item metadata (not values, which would prompt).
+        proc = _run(["security", "dump-keychain"], check=False)
+        blob = proc.stdout.decode("utf-8", "replace")
+        names = []
+        current = None
+        for line in blob.splitlines():
+            line = line.strip()
+            acct = re.match(r'"acct"<blob>="(.*)"$', line)
+            if acct:
+                current = acct.group(1)
+                continue
+            svce = re.match(r'"svce"<blob>="(.*)"$', line)
+            if svce and svce.group(1) == SERVICE and current:
+                names.append(current)
+                current = None
+        return sorted(set(names))
+
+
+class DpapiBackend:
+    """Windows: DPAPI-encrypted files under %LOCALAPPDATA%\\maskrun.
+
+    Windows has no scriptable equivalent of `secret-tool`: Credential Manager's
+    PowerShell module is not built in, and cmdkey cannot read a secret back.
+    DPAPI (CryptProtectData) is part of the OS, ties the ciphertext to the
+    logged-in user account, and needs no third-party dependency — the same
+    protection model as a per-user keyring.
+    """
+
+    name = "dpapi"
+
+    def __init__(self):
+        import ctypes
+        from ctypes import wintypes
+
+        self.ctypes = ctypes
+        self.crypt32 = ctypes.windll.crypt32
+        self.kernel32 = ctypes.windll.kernel32
+
+        class DATA_BLOB(ctypes.Structure):
+            _fields_ = [
+                ("cbData", wintypes.DWORD),
+                ("pbData", ctypes.POINTER(ctypes.c_char)),
+            ]
+
+        self.DATA_BLOB = DATA_BLOB
+
+    @property
+    def _dir(self):
+        base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+        path = os.path.join(base, "maskrun", "secrets")
+        os.makedirs(path, exist_ok=True)
+        return path
+
+    def _path(self, secret):
+        return os.path.join(self._dir, secret + ".dpapi")
+
+    def _blob_in(self, data):
+        buf = self.ctypes.create_string_buffer(data, len(data))
+        return self.DATA_BLOB(len(data), self.ctypes.cast(
+            buf, self.ctypes.POINTER(self.ctypes.c_char)))
+
+    def _blob_out_bytes(self, blob):
+        out = self.ctypes.string_at(blob.pbData, blob.cbData)
+        self.kernel32.LocalFree(blob.pbData)
+        return out
+
+    def put(self, secret, value):
+        src = self._blob_in(value.encode("utf-8"))
+        dst = self.DATA_BLOB()
+        ok = self.crypt32.CryptProtectData(
+            self.ctypes.byref(src), u"maskrun", None, None, None, 0,
+            self.ctypes.byref(dst))
+        if not ok:
+            raise MaskrunError("DPAPI CryptProtectData failed")
+        data = self._blob_out_bytes(dst)
+        tmp = self._path(secret) + ".tmp"
+        with open(tmp, "wb") as fh:
+            fh.write(data)
+        os.replace(tmp, self._path(secret))
+
+    def get(self, secret):
+        path = self._path(secret)
+        if not os.path.exists(path):
+            return None
+        with open(path, "rb") as fh:
+            data = fh.read()
+        src = self._blob_in(data)
+        dst = self.DATA_BLOB()
+        ok = self.crypt32.CryptUnprotectData(
+            self.ctypes.byref(src), None, None, None, None, 0,
+            self.ctypes.byref(dst))
+        if not ok:
+            raise MaskrunError(
+                "DPAPI CryptUnprotectData failed for '%s' — the file may have "
+                "been written by a different Windows user account." % secret)
+        return self._blob_out_bytes(dst).decode("utf-8")
+
+    def delete(self, secret):
+        path = self._path(secret)
+        if not os.path.exists(path):
+            raise MaskrunError("no such secret: %s" % secret)
+        os.remove(path)
+
+    def list(self):
+        try:
+            entries = os.listdir(self._dir)
+        except OSError:
+            return []
+        return sorted(e[:-len(".dpapi")] for e in entries if e.endswith(".dpapi"))
+
+
+def pick_backend():
+    override = os.environ.get("MASKRUN_BACKEND", "").strip().lower()
+    table = {
+        "secret-service": SecretServiceBackend,
+        "keychain": KeychainBackend,
+        "dpapi": DpapiBackend,
+        "file": None,  # reserved; see README
+    }
+    if override:
+        cls = table.get(override)
+        if cls is None:
+            raise MaskrunError(
+                "unknown MASKRUN_BACKEND=%r (expected secret-service, keychain "
+                "or dpapi)" % override)
+        return cls()
+
+    system = platform.system()
+    if system == "Darwin":
+        return KeychainBackend()
+    if system == "Windows":
+        return DpapiBackend()
+    return SecretServiceBackend()
+
+
+def check_name(secret):
+    if not NAME_RE.match(secret or ""):
+        raise MaskrunError(
+            "invalid secret name %r — use letters, digits, dot, dash and "
+            "underscore, starting with a letter or digit." % secret)
+    return secret
+
+
+# --------------------------------------------------------------------------
+# Manifest
+# --------------------------------------------------------------------------
+
+def find_manifest(start=None):
+    """Walk upwards for a .maskrun file, so subdirectories work too."""
+    directory = os.path.abspath(start or os.getcwd())
+    while True:
+        candidate = os.path.join(directory, MANIFEST)
+        if os.path.isfile(candidate):
+            return candidate
+        parent = os.path.dirname(directory)
+        if parent == directory:
+            return None
+        directory = parent
+
+
+def read_manifest(path):
+    """Return [(VAR, secret-name), ...] preserving file order."""
+    pairs = []
+    with open(path, "r", encoding="utf-8") as fh:
+        for lineno, raw in enumerate(fh, 1):
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" not in line:
+                raise MaskrunError(
+                    "%s:%d: expected VAR=secret-name, got %r" % (path, lineno, line))
+            var, _, secret = line.partition("=")
+            var, secret = var.strip(), secret.strip()
+            if not var or not secret:
+                raise MaskrunError(
+                    "%s:%d: expected VAR=secret-name, got %r" % (path, lineno, line))
+            pairs.append((var, secret))
+    return pairs
+
+
+def require_manifest():
+    path = find_manifest()
+    if not path:
+        raise MaskrunError(
+            "no %s found in this directory or any parent.\n"
+            "Create one with lines like:\n"
+            "    DATABASE_URL=myapp-database-url\n"
+            "or generate it from an existing .env with: maskrun import .env"
+            % MANIFEST)
+    return path
+
+
+# --------------------------------------------------------------------------
+# Agent detection and masking policy
+# --------------------------------------------------------------------------
+
+# Set MASKRUN_AGENT=1 for any harness not listed here.
+AGENT_ENV_VARS = (
+    "MASKRUN_AGENT",
+    "CLAUDECODE",
+    "CLAUDE_CODE_ENTRYPOINT",
+    "AI_AGENT",
+    "AIDER_CHAT",
+    "CURSOR_AGENT",
+    "OPENAI_CODEX",
+    "GEMINI_CLI",
+    "REPLIT_AGENT",
+)
+
+
+def in_agent() -> bool:
+    if os.environ.get("MASKRUN_AGENT", "") in ("0", "false", "no"):
+        return False
+    return any(os.environ.get(var) for var in AGENT_ENV_VARS)
+
+
+def should_mask(raw=False, force=False) -> bool:
+    if force:
+        return True
+    if raw:
+        return False
+    flag = os.environ.get("MASKRUN_MASK", "")
+    if flag in ("0", "false", "no"):
+        return False
+    if flag in ("1", "true", "yes"):
+        return True
+    if in_agent():
+        return True
+    try:
+        return not sys.stdout.isatty()
+    except (AttributeError, ValueError):
+        return True
+
+
+def refuse_in_agent(command, alternative):
+    if in_agent() and os.environ.get("MASKRUN_ALLOW_READ") != "1":
+        raise MaskrunError(
+            "'%s' is disabled inside an AI agent session — the value would go "
+            "straight into the transcript.\n%s\n"
+            "If you need the value itself (rotating a key, pasting it into a "
+            "dashboard), run this in your own terminal." % (command, alternative))
+
+
+# --------------------------------------------------------------------------
+# Output redaction
+# --------------------------------------------------------------------------
+
+def value_variants(value):
+    """Every spelling of a secret that could plausibly appear in output."""
+    seen = set()
+    candidates = [
+        value,
+        base64.b64encode(value.encode()).decode(),
+        urllib.parse.quote(value, safe=""),
+    ]
+    if "\\" in value or '"' in value or "\n" in value:
+        candidates.append(
+            value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n"))
+    for candidate in candidates:
+        if len(candidate) >= MIN_MASK_LEN and candidate not in seen:
+            seen.add(candidate)
+            yield candidate
+
+
+def build_filter(pairs):
+    """pairs: [(VAR, value)]. Returns (pattern, table, line_safe) or None."""
+    entries = []
+    short = []
+    for var, value in pairs:
+        if not value:
+            continue
+        if len(value) < MIN_MASK_LEN:
+            short.append(var)
+            continue
+        label = ("<masked:%s>" % var).encode()
+        for variant in value_variants(value):
+            entries.append((variant.encode(), label))
+
+    if short:
+        sys.stderr.write(
+            "maskrun: %s shorter than %d characters, left unmasked (masking a "
+            "short value would corrupt unrelated output).\n"
+            % (", ".join(short), MIN_MASK_LEN))
+
+    if not entries:
+        return None
+
+    # Longest first: a short variant can be a substring of a longer one.
+    entries.sort(key=lambda pair: len(pair[0]), reverse=True)
+    table = dict(entries)
+    pattern = re.compile(b"|".join(re.escape(v) for v, _ in entries))
+    line_safe = not any(b"\n" in v for v, _ in entries)
+    return pattern, table, line_safe
+
+
+class StreamPump:
+    """Reads one pipe, masks secrets, writes to the real stream.
+
+    Holds back a tail so a value split across two writes is still caught: up to
+    the last complete line when no secret contains a newline, otherwise the
+    last TAIL_HOLD bytes.
+
+    Threads rather than selectors: select() does not work on pipes on Windows.
+    """
+
+    def __init__(self, source, sink, spec):
+        self.source = source
+        self.sink = sink
+        self.pattern, self.table, self.line_safe = spec
+        self.buffer = b""
+
+    def _mask(self, data):
+        return self.pattern.sub(lambda m: self.table[m.group(0)], data)
+
+    def _write(self, data):
+        if not data:
+            return
+        self.sink.write(self._mask(data))
+        self.sink.flush()
+
+    def pump(self):
+        while True:
+            chunk = self.source.read(65536)
+            if not chunk:
+                self._write(self.buffer)
+                self.buffer = b""
+                return
+            self.buffer += chunk
+            if self.line_safe and b"\n" in self.buffer:
+                cut = self.buffer.rindex(b"\n") + 1
+                ready, self.buffer = self.buffer[:cut], self.buffer[cut:]
+            elif len(self.buffer) > TAIL_HOLD:
+                ready, self.buffer = self.buffer[:-TAIL_HOLD], self.buffer[-TAIL_HOLD:]
+            else:
+                ready = b""
+            self._write(ready)
+
+
+def exec_with_env(argv, injected):
+    """Replace this process with the command (POSIX) or wait for it."""
+    env = dict(os.environ)
+    env.update(injected)
+    if os.name == "posix":
+        try:
+            os.execvpe(argv[0], argv, env)
+        except FileNotFoundError:
+            raise MaskrunError("command not found: %s" % argv[0])
+    try:
+        return subprocess.call(argv, env=env)
+    except FileNotFoundError:
+        raise MaskrunError("command not found: %s" % argv[0])
+
+
+def run_masked(argv, injected):
+    """Run the command with secrets injected and its output redacted."""
+    spec = build_filter(list(injected.items()))
+    if spec is None:
+        return exec_with_env(argv, injected)
+
+    env = dict(os.environ)
+    env.update(injected)
+    try:
+        proc = subprocess.Popen(
+            argv, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except FileNotFoundError:
+        raise MaskrunError("command not found: %s" % argv[0])
+
+    pumps = [
+        StreamPump(proc.stdout, sys.stdout.buffer, spec),
+        StreamPump(proc.stderr, sys.stderr.buffer, spec),
+    ]
+    threads = [threading.Thread(target=p.pump, daemon=True) for p in pumps]
+    for thread in threads:
+        thread.start()
+
+    try:
+        code = proc.wait()
+    except KeyboardInterrupt:
+        # The child is in our process group and already got the signal;
+        # drain its output, then report the conventional exit status.
+        code = proc.wait()
+        for thread in threads:
+            thread.join(timeout=5)
+        return 130
+
+    for thread in threads:
+        thread.join(timeout=5)
+    return code
+
+
+def collect(pairs, backend):
+    """pairs: [(VAR, secret-name)] -> {VAR: value}, failing if any is missing."""
+    injected = {}
+    missing = []
+    for var, secret in pairs:
+        value = backend.get(secret)
+        if value is None or value == "":
+            missing.append((var, secret))
+            continue
+        injected[var] = value
+    if missing:
+        lines = "\n".join(
+            "    %-28s -> %s" % (var, secret) for var, secret in missing)
+        raise MaskrunError(
+            "refusing to run with a half-filled environment. Missing from the "
+            "keyring:\n%s\nAdd them with: maskrun put <name>" % lines)
+    return injected
+
+
+# --------------------------------------------------------------------------
+# Commands
+# --------------------------------------------------------------------------
+
+def cmd_put(args, backend):
+    secret = check_name(args.name)
+    if args.stdin:
+        value = sys.stdin.read()
+        if value.endswith("\n"):
+            value = value[:-1]
+    else:
+        import getpass
+        value = getpass.getpass("Value for %s (not echoed): " % secret)
+        if not value:
+            raise MaskrunError("empty value, nothing stored")
+    backend.put(secret, value)
+    print("stored: %s" % secret)
+    return 0
+
+
+def cmd_get(args, backend):
+    refuse_in_agent(
+        "maskrun get",
+        "  To USE the secret:  maskrun run -- <command>\n"
+        "                      maskrun exec VAR=name -- <command>\n"
+        "  To see which secrets exist:  maskrun list")
+    secret = check_name(args.name)
+    value = backend.get(secret)
+    if value is None:
+        raise MaskrunError("no such secret: %s" % secret)
+    sys.stdout.write(value)
+    if not value.endswith("\n"):
+        sys.stdout.write("\n")
+    return 0
+
+
+def cmd_list(args, backend):
+    names = backend.list()
+    if not names:
+        print("(no secrets stored)")
+        return 0
+    for name in names:
+        print(name)
+    return 0
+
+
+def cmd_rm(args, backend):
+    secret = check_name(args.name)
+    if backend.get(secret) is None:
+        raise MaskrunError("no such secret: %s" % secret)
+    backend.delete(secret)
+    print("deleted: %s" % secret)
+    return 0
+
+
+def cmd_status(args, backend):
+    path = require_manifest()
+    pairs = read_manifest(path)
+    print("manifest: %s" % path)
+    print("backend:  %s" % backend.name)
+    missing = 0
+    for var, secret in pairs:
+        present = backend.get(secret) not in (None, "")
+        mark = "ok     " if present else "MISSING"
+        print("  %s %-28s -> %s" % (mark, var, secret))
+        if not present:
+            missing += 1
+    if missing:
+        print("\n%d secret(s) missing. Add them with: maskrun put <name>" % missing)
+        return 1
+    print("\nall %d secret(s) present." % len(pairs))
+    return 0
+
+
+def cmd_run(args, backend):
+    if not args.command:
+        raise MaskrunError("nothing to run. Usage: maskrun run -- <command>")
+    path = require_manifest()
+    injected = collect(read_manifest(path), backend)
+    if should_mask(raw=args.raw, force=args.mask):
+        return run_masked(args.command, injected)
+    return exec_with_env(args.command, injected)
+
+
+def cmd_exec(args, backend):
+    if not args.command:
+        raise MaskrunError(
+            "nothing to run. Usage: maskrun exec VAR=secret-name -- <command>")
+    if not args.assignment:
+        raise MaskrunError(
+            "no VAR=secret-name given. Usage: maskrun exec VAR=name -- <command>")
+    pairs = []
+    for item in args.assignment:
+        if "=" not in item:
+            raise MaskrunError("expected VAR=secret-name, got %r" % item)
+        var, _, secret = item.partition("=")
+        pairs.append((var.strip(), check_name(secret.strip())))
+    injected = collect(pairs, backend)
+    if should_mask(raw=args.raw, force=args.mask):
+        return run_masked(args.command, injected)
+    return exec_with_env(args.command, injected)
+
+
+ENV_LINE_RE = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=(.*)$")
+
+
+def parse_env_file(path):
+    """Yield (VAR, value) from a .env file, unwrapping surrounding quotes."""
+    with open(path, "r", encoding="utf-8", errors="replace") as fh:
+        for raw in fh:
+            line = raw.rstrip("\r\n")
+            if not line.strip() or line.lstrip().startswith("#"):
+                continue
+            match = ENV_LINE_RE.match(line)
+            if not match:
+                continue
+            var, value = match.group(1), match.group(2).strip()
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+                value = value[1:-1]
+            yield var, value
+
+
+# Client-bundled prefixes: these ship to the browser anyway, so they are
+# configuration, not secrets, and moving them buys nothing.
+PUBLIC_PREFIXES = ("VITE_", "NEXT_PUBLIC_", "PUBLIC_", "REACT_APP_",
+                   "NUXT_PUBLIC_", "EXPO_PUBLIC_", "GATSBY_")
+
+
+def cmd_import(args, backend):
+    refuse_in_agent(
+        "maskrun import",
+        "  Reading a .env pulls its entire contents into the transcript, which\n"
+        "  is the exact thing maskrun exists to prevent.")
+    if not os.path.isfile(args.envfile):
+        raise MaskrunError("no such file: %s" % args.envfile)
+    prefix = args.prefix or os.path.basename(os.path.abspath(os.getcwd()))
+
+    rows = []
+    skipped = []
+    for var, value in parse_env_file(args.envfile):
+        if not args.all and var.startswith(PUBLIC_PREFIXES):
+            skipped.append(var)
+            continue
+        secret = "%s-%s" % (prefix, var.lower().replace("_", "-"))
+        rows.append((var, check_name(secret), value))
+
+    if not rows:
+        raise MaskrunError("nothing to import from %s" % args.envfile)
+
+    for var, secret, value in rows:
+        if args.dry_run:
+            print("  %-28s -> %-40s (%d chars)" % (var, secret, len(value)))
+        else:
+            backend.put(secret, value)
+            print("  stored %-28s -> %s" % (var, secret))
+
+    if skipped:
+        print("\nskipped %d client-bundled variable(s) (not secrets): %s"
+              % (len(skipped), ", ".join(skipped)))
+        print("Use --all to import them anyway.")
+
+    body = "".join("%s=%s\n" % (var, secret) for var, secret, _ in rows)
+    header = (
+        "# maskrun manifest — secret NAMES, never values. Safe to commit.\n"
+        "# Run commands with: maskrun run -- <command>\n")
+
+    if args.dry_run:
+        print("\n--- %s that would be written (%d lines) ---" % (MANIFEST, len(rows)))
+        sys.stdout.write(body)
+        print("--- dry run: nothing was written ---")
+        return 0
+
+    with open(MANIFEST, "w", encoding="utf-8") as fh:
+        fh.write(header + body)
+    print("\n%d secret(s) stored, %s written." % (len(rows), MANIFEST))
+    print("Verify with: maskrun status")
+    print("Then check it runs (maskrun run -- <command>) BEFORE deleting %s."
+          % args.envfile)
+    return 0
+
+
+# --------------------------------------------------------------------------
+# Agent guard (`maskrun hook`)
+# --------------------------------------------------------------------------
+
+HARMLESS_ENV = re.compile(
+    r"\.env\.(example|sample|template|dist|defaults?|tpl|ornek)$", re.I)
+ENV_PATH_RE = re.compile(r"[\w./~-]*\.env(?:\.[\w-]+)*\b|[\w./~-]*\.envrc\b")
+
+# Commands that put file contents where the agent can read them.
+# `.` (the source shorthand) is deliberately absent: it matches the dot of
+# ".env" itself, which blocked innocent commands like `rm .env`.
+READERS = {
+    "cat", "bat", "tac", "nl", "less", "more", "head", "tail", "strings",
+    "xxd", "od", "hexdump", "vi", "vim", "view", "nvim", "nano", "emacs",
+    "jq", "yq", "dotenv", "source",
+    "grep", "egrep", "fgrep", "rg", "ag", "sed", "awk", "cut", "diff",
+    "type", "gc",  # PowerShell aliases for Get-Content
+}
+SEPARATORS = {"|", "||", "&&", ";", "&", "|&"}
+ENV_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+HEREDOC_RE = re.compile(r"<<-?\s*(['\"]?)(\w+)\1")
+
+GUARD_RULES = [
+    (re.compile(r"\bmaskrun\s+get\b"),
+     "`maskrun get` prints the value to stdout, which lands directly in the "
+     "transcript. To USE a secret: `maskrun run -- <command>` or "
+     "`maskrun exec VAR=name -- <command>`. To see what exists: `maskrun list`."),
+    (re.compile(r"\bmaskrun\s+import\b"),
+     "`maskrun import` reads the whole .env, so its contents enter the "
+     "transcript. Let the human run this in their own terminal."),
+    (re.compile(r"\bsecret-tool\s+(?:lookup|search)\b"),
+     "`secret-tool lookup/search` reads the keyring directly and prints the "
+     "value. Use `maskrun list` for names."),
+    (re.compile(r"\bsecurity\s+find-generic-password\b"),
+     "`security find-generic-password` prints the keychain value. Use "
+     "`maskrun list` for names."),
+    (re.compile(r"\bmaskrun\s+(?:run|exec)\b(?=[^|;&]*\s--raw\b)"),
+     "`--raw` turns output masking off, so a secret can leak into the "
+     "transcript. Drop the flag — masking is automatic in an agent session."),
+    (re.compile(r"\bMASKRUN_MASK\s*=\s*0\b"),
+     "MASKRUN_MASK=0 turns output masking off. Do not set it."),
+    (re.compile(r"\bMASKRUN_ALLOW_READ\s*=\s*1\b"),
+     "MASKRUN_ALLOW_READ=1 re-enables `maskrun get` inside an agent session, "
+     "which defeats the guard."),
+    (re.compile(r"/proc/(?:\d+|self|\$\w+|\$\{\w+\})/environ"),
+     "/proc/<pid>/environ dumps a running process's environment, which is "
+     "where injected secrets live."),
+    (re.compile(r"(?:^|[|;&]\s*)(?:printenv|env)\s*(?:$|[|>;&])"),
+     "A bare `env` / `printenv` dumps the whole environment, injected secrets "
+     "included. Name the variable you want (`printenv PATH`)."),
+    (re.compile(r"(?:Get-ChildItem|gci|ls|dir)\s+Env:(?:\s|$|\|)", re.I),
+     "`Get-ChildItem Env:` dumps the whole environment in PowerShell. Read a "
+     "single variable instead ($env:PATH)."),
+]
+
+
+def strip_heredocs(command):
+    """Drop heredoc bodies — a body is data, not a command.
+
+    Parsing bodies as commands produced false positives: a command that merely
+    WROTE the words ".env" and "head" looked like a leak. Bodies also break
+    shlex (unbalanced quotes), after which whitespace splitting cut pipeline
+    segments in the wrong places.
+    """
+    lines = command.split("\n")
+    kept = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        kept.append(line)
+        tags = [m.group(2) for m in HEREDOC_RE.finditer(line)]
+        i += 1
+        for tag in tags:
+            while i < len(lines) and lines[i].strip() != tag:
+                i += 1
+            i += 1  # skip the terminator itself
+    return "\n".join(kept)
+
+
+def pipeline_segments(command):
+    try:
+        words = shlex.split(command, comments=False, posix=True)
+    except ValueError:
+        words = command.split()
+    groups = [[]]
+    for word in words:
+        if word in SEPARATORS:
+            groups.append([])
+        else:
+            groups[-1].append(word)
+    return [g for g in groups if g]
+
+
+def segment_command(segment):
+    """The command a segment actually runs; skips VAR=x prefixes and sudo."""
+    for word in segment:
+        if ENV_ASSIGN_RE.match(word) or word in ("sudo", "command", "exec", "time"):
+            continue
+        return os.path.basename(word).lower()
+    return ""
+
+
+def reads_env_file(command):
+    """Is a secret-bearing .env actually being READ here?"""
+    for segment in pipeline_segments(command):
+        if segment_command(segment) not in READERS:
+            continue
+        for word in segment[1:]:
+            for path in ENV_PATH_RE.findall(word):
+                if path and not HARMLESS_ENV.search(path):
+                    return (
+                        "'%s' is a .env file; reading it puts secrets in the "
+                        "transcript. Check what the keyring holds with "
+                        "`maskrun status` and run the command with "
+                        "`maskrun run -- <command>`. Templates such as "
+                        ".env.example are fine to read." % path)
+    return None
+
+
+def guard_decision(payload):
+    """Returns a deny reason, or None to allow."""
+    tool = payload.get("tool_name", "")
+    tool_input = payload.get("tool_input") or {}
+
+    if tool in ("Bash", "BashOutput"):
+        command = tool_input.get("command") or ""
+        # Heredoc bodies sit outside both checks. Without this, DOCUMENTING
+        # maskrun was impossible: writing the words "maskrun get" into a note
+        # tripped the rule. A script written into a body and then executed is
+        # still caught by the CLI's own refusal in an agent session.
+        clean = strip_heredocs(command)
+        for pattern, reason in GUARD_RULES:
+            if pattern.search(clean):
+                return reason
+        return reads_env_file(clean)
+
+    if tool in ("Read", "Edit", "Write", "NotebookEdit"):
+        path = (tool_input.get("file_path")
+                or tool_input.get("notebook_path") or "")
+        base = os.path.basename(path)
+        looks_env = base == ".env" or base.startswith(".env.") or base == ".envrc"
+        if looks_env and not HARMLESS_ENV.search(base):
+            return (
+                "'%s' is a .env file; reading it puts secrets in the "
+                "transcript. Use `maskrun status` to see what the keyring "
+                "holds and `maskrun run -- <command>` to run with them."
+                % path)
+    return None
+
+
+CLAUDE_HOOK_MATCHER = "Bash|Read|Edit|Write|NotebookEdit"
+
+
+def claude_settings_path():
+    base = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(
+        os.path.expanduser("~"), ".claude")
+    return os.path.join(base, "settings.json")
+
+
+def cmd_install_guard(args, backend):
+    """Merge (or remove) the guard hook in an agent harness's config.
+
+    Done here rather than in install.sh because editing someone's settings.json
+    from shell script is how you lose their other hooks.
+    """
+    if args.harness != "claude-code":
+        raise MaskrunError("unknown harness %r (only claude-code so far)" % args.harness)
+
+    path = args.config or claude_settings_path()
+    settings = {}
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                content = fh.read().strip()
+            settings = json.loads(content) if content else {}
+        except ValueError as exc:
+            raise MaskrunError(
+                "%s is not valid JSON (%s). Fix or move it first — refusing to "
+                "overwrite a broken config, since that would silently disable "
+                "every setting in it." % (path, exc))
+        if not isinstance(settings, dict):
+            raise MaskrunError("%s does not contain a JSON object" % path)
+
+    hooks = settings.setdefault("hooks", {})
+    pre = hooks.setdefault("PreToolUse", [])
+    if not isinstance(pre, list):
+        raise MaskrunError("%s: hooks.PreToolUse is not a list" % path)
+
+    def is_ours(block):
+        return any("maskrun" in (h.get("command") or "")
+                   for h in (block.get("hooks") or [])
+                   if isinstance(h, dict))
+
+    existing = [i for i, block in enumerate(pre)
+                if isinstance(block, dict) and is_ours(block)]
+
+    if args.remove:
+        if not existing:
+            print("maskrun guard is not installed in %s" % path)
+            return 0
+        for index in reversed(existing):
+            pre.pop(index)
+        if not pre:
+            hooks.pop("PreToolUse", None)
+        if not hooks:
+            settings.pop("hooks", None)
+    else:
+        entry = {
+            "matcher": CLAUDE_HOOK_MATCHER,
+            "hooks": [{
+                "type": "command",
+                "command": "%s hook" % (args.command_path or "maskrun"),
+                "timeout": 10,
+                "statusMessage": "maskrun guard",
+            }],
+        }
+        if existing:
+            pre[existing[0]] = entry
+            for index in reversed(existing[1:]):
+                pre.pop(index)
+        else:
+            pre.append(entry)
+
+    if args.dry_run:
+        print("--- %s would become ---" % path)
+        print(json.dumps(settings, indent=2, ensure_ascii=False))
+        print("--- dry run: nothing was written ---")
+        return 0
+
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    if os.path.exists(path):
+        backup = path + ".maskrun-backup"
+        with open(path, "r", encoding="utf-8") as src:
+            data = src.read()
+        with open(backup, "w", encoding="utf-8") as dst:
+            dst.write(data)
+        print("backed up: %s" % backup)
+
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(settings, fh, indent=2, ensure_ascii=False)
+        fh.write("\n")
+    os.replace(tmp, path)
+
+    if args.remove:
+        print("removed the maskrun guard from %s" % path)
+    else:
+        print("installed the maskrun guard in %s" % path)
+        print("Other hooks in that file were left untouched.")
+        print("Restart Claude Code (or open /hooks once) to load it.")
+    return 0
+
+
+def cmd_hook(args, backend):
+    """PreToolUse guard for agent harnesses. Reads JSON on stdin."""
+    try:
+        payload = json.load(sys.stdin)
+    except Exception:
+        return 0  # unparseable input must never block work
+    reason = guard_decision(payload)
+    if reason is None:
+        return 0
+    print(json.dumps({
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": "maskrun guard: " + reason,
+        }
+    }))
+    return 0
+
+
+# --------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------
+
+EPILOG = """\
+examples:
+  maskrun put myapp-database-url        store a secret (prompts, not echoed)
+  maskrun import .env --dry-run         see what would move to the keyring
+  maskrun status                        is every manifest entry present?
+  maskrun run -- npm run dev            run with secrets injected, output masked
+  maskrun exec API_KEY=my-key -- curl https://api.example.com
+  maskrun list                          names only, never values
+
+Output masking is automatic in an AI agent session and whenever stdout is not a
+terminal. --raw turns it off, --mask forces it on.
+"""
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="maskrun",
+        description="Run commands with secrets from your OS keyring, without "
+                    "leaking them into an AI agent's context.",
+        epilog=EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("--version", action="version",
+                        version="maskrun %s" % __version__)
+    subparsers = parser.add_subparsers(dest="cmd")
+
+    p = subparsers.add_parser("put", help="store a secret in the keyring")
+    p.add_argument("name")
+    p.add_argument("--stdin", action="store_true",
+                   help="read the value from stdin instead of prompting")
+    p.set_defaults(func=cmd_put)
+
+    p = subparsers.add_parser("get", help="print a secret (refused in an agent session)")
+    p.add_argument("name")
+    p.set_defaults(func=cmd_get)
+
+    p = subparsers.add_parser("list", help="list secret names (never values)")
+    p.set_defaults(func=cmd_list)
+
+    p = subparsers.add_parser("rm", help="delete a secret")
+    p.add_argument("name")
+    p.set_defaults(func=cmd_rm)
+
+    p = subparsers.add_parser("status", help="check the manifest against the keyring")
+    p.set_defaults(func=cmd_status)
+
+    p = subparsers.add_parser("run", help="run a command with the manifest injected")
+    p.add_argument("--raw", action="store_true", help="do not mask output")
+    p.add_argument("--mask", action="store_true", help="always mask output")
+    p.add_argument("command", nargs="*")
+    p.set_defaults(func=cmd_run)
+
+    p = subparsers.add_parser("exec", help="run with explicit VAR=secret-name pairs")
+    p.add_argument("--raw", action="store_true", help="do not mask output")
+    p.add_argument("--mask", action="store_true", help="always mask output")
+    p.add_argument("assignment", nargs="*", help="VAR=secret-name")
+    p.set_defaults(func=cmd_exec)
+
+    p = subparsers.add_parser("import", help="move a .env into the keyring")
+    p.add_argument("envfile")
+    p.add_argument("--prefix", help="secret name prefix (default: directory name)")
+    p.add_argument("--dry-run", action="store_true", help="write nothing")
+    p.add_argument("--all", action="store_true",
+                   help="also import client-bundled vars (VITE_, NEXT_PUBLIC_, ...)")
+    p.set_defaults(func=cmd_import)
+
+    p = subparsers.add_parser(
+        "hook", help="PreToolUse guard for agent harnesses (reads JSON on stdin)")
+    p.set_defaults(func=cmd_hook)
+
+    p = subparsers.add_parser(
+        "install-guard", help="add the guard hook to an agent harness's config")
+    p.add_argument("--harness", default="claude-code",
+                   help="which harness (default: claude-code)")
+    p.add_argument("--remove", action="store_true", help="uninstall instead")
+    p.add_argument("--dry-run", action="store_true", help="print, write nothing")
+    p.add_argument("--config", help="settings file to edit (default: ~/.claude/settings.json)")
+    p.add_argument("--command-path", help="how to invoke maskrun (default: 'maskrun')")
+    p.set_defaults(func=cmd_install_guard)
+
+    return parser
+
+
+def split_leading_command(argv):
+    """Support the bare form `maskrun -- <command>` as a shorthand for run."""
+    if argv and argv[0] == "--":
+        return ["run"] + argv
+    return argv
+
+
+def extract_command(argv):
+    """Split argv at the first '--'; everything after it is the child command.
+
+    Done by hand rather than with argparse.REMAINDER: argparse swallows the
+    first '--' itself, after which `exec`'s nargs='*' assignment list also ate
+    the command and nothing was left to run.
+    """
+    if "--" in argv:
+        index = argv.index("--")
+        return argv[:index], argv[index + 1:]
+    return argv, []
+
+
+def main(argv=None):
+    argv = split_leading_command(list(sys.argv[1:] if argv is None else argv))
+    head, tail = extract_command(argv)
+    parser = build_parser()
+    args = parser.parse_args(head)
+    if not getattr(args, "cmd", None):
+        parser.print_help()
+        return 1
+    if hasattr(args, "command") or tail:
+        args.command = list(getattr(args, "command", []) or []) + tail
+    # Without '--', `exec` cannot tell pairs from the command; say so clearly.
+    for item in getattr(args, "assignment", None) or []:
+        if "=" not in item:
+            sys.stderr.write(
+                "maskrun: %r is not a VAR=secret-name pair. Put '--' before "
+                "the command: maskrun exec VAR=name -- <command>\n" % item)
+            return 1
+
+    try:
+        # The guard and the installer need no keyring, and must never fail
+        # because one is absent.
+        no_keyring = ("hook", "install-guard")
+        backend = None if args.cmd in no_keyring else pick_backend()
+        return args.func(args, backend)
+    except MaskrunError as exc:
+        sys.stderr.write("maskrun: %s\n" % exc)
+        return 1
+    except BrokenPipeError:
+        return 0
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())

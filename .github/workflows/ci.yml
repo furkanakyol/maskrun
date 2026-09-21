@@ -1,0 +1,176 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  linux:
+    name: linux · py${{ matrix.python }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.9', '3.11', '3.13']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Install Secret Service
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libsecret-tools gnome-keyring dbus-x11
+
+      # --require-keyring makes a silently skipped backend fail the job, so a
+      # green tick here always means the keyring tests really ran.
+      - name: Test
+        run: |
+          dbus-run-session -- bash -c '
+            set -u
+            printf "\n" | gnome-keyring-daemon --unlock --components=secrets >/dev/null 2>&1 || true
+            for _ in $(seq 1 30); do
+              if printf "warmup" | secret-tool store --label=ci service maskrun-ci name warmup 2>/dev/null; then
+                secret-tool clear service maskrun-ci name warmup 2>/dev/null || true
+                break
+              fi
+              sleep 1
+            done
+            python test/test_maskrun.py --require-keyring
+          '
+
+  macos:
+    name: macos · keychain
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Create a disposable keychain
+        run: |
+          security create-keychain -p "" maskrun-ci.keychain
+          security default-keychain -s maskrun-ci.keychain
+          security unlock-keychain -p "" maskrun-ci.keychain
+          # no auto-lock: a locked keychain mid-run would prompt and hang
+          security set-keychain-settings maskrun-ci.keychain
+
+      - name: Test
+        run: python test/test_maskrun.py --require-keyring
+
+  windows:
+    name: windows · dpapi
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      # DPAPI needs no service, so this needs no setup at all.
+      - name: Test
+        run: python test/test_maskrun.py --require-keyring
+
+  no-keyring:
+    name: linux · no keyring (guard still works)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      # The README promises the guard works with no keyring present, e.g. in a
+      # bare container. This job is what keeps that promise honest.
+      - name: Test without a backend
+        run: python test/test_maskrun.py
+
+      - name: Guard must answer without a keyring
+        run: |
+          echo '{"tool_name":"Bash","tool_input":{"command":"maskrun get x"}}' \
+            | python bin/maskrun hook | grep -q '"deny"'
+          echo '{"tool_name":"Bash","tool_input":{"command":"maskrun status"}}' \
+            | python bin/maskrun hook | wc -c | grep -qx '0'
+
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Byte-compile
+        run: python -m py_compile bin/maskrun test/test_maskrun.py
+
+      - name: Shell lint
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq shellcheck
+          shellcheck --shell=sh install.sh
+
+      - name: PowerShell lint
+        shell: pwsh
+        run: |
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+            "$PWD/install.ps1", [ref]$null, [ref]$errors) | Out-Null
+          if ($errors) { $errors | ForEach-Object { Write-Error $_ }; exit 1 }
+          Write-Host "install.ps1 parses cleanly"
+
+  installer:
+    name: installer · ${{ matrix.os }}
+    if: github.event_name == 'push'
+    needs: [linux, macos, windows]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      # Fetches from this very commit, so the published one-liner is tested
+      # end to end rather than assumed to work.
+      - name: Install from this commit
+        env:
+          MASKRUN_REF: ${{ github.sha }}
+          MASKRUN_BIN: ${{ runner.temp }}/bin
+        run: sh install.sh
+
+      - name: Installed binary runs
+        run: |
+          "${{ runner.temp }}/bin/maskrun" --version
+          "${{ runner.temp }}/bin/maskrun" --help > /dev/null
+
+  installer-windows:
+    name: installer · windows
+    if: github.event_name == 'push'
+    needs: [windows]
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install from this commit
+        shell: pwsh
+        env:
+          MASKRUN_REF: ${{ github.sha }}
+          MASKRUN_BIN: ${{ runner.temp }}\bin
+        run: ./install.ps1
+
+      - name: Installed shim runs
+        shell: cmd
+        run: |
+          "${{ runner.temp }}\bin\maskrun.cmd" --version
