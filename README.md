@@ -321,4 +321,13 @@ trait's `put`/`get`/`delete`/`list`; adding a harness means one entry under
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+Copyright (C) 2026 Furkan Akyol.
+
+maskrun is free software: you may redistribute and modify it under the terms
+of the GNU General Public License, version 3 or any later version, as
+published by the Free Software Foundation. It comes with no warranty. See
+[LICENSE](LICENSE) for the full terms.
+
+A practical consequence: if you distribute a modified maskrun — as source, as
+a binary, or inside a product — you must make your modified source available
+to whoever you distribute it to, under this same license.

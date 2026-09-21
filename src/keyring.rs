@@ -402,8 +402,8 @@ pub mod windows {
     use ::windows::core::{HRESULT, PWSTR};
     use ::windows::Win32::Foundation::{ERROR_NOT_FOUND, FILETIME};
     use ::windows::Win32::Security::Credentials::{
-        CredDeleteW, CredEnumerateW, CredFree, CredReadW, CredWriteW, CREDENTIALW,
-        CRED_ENUMERATE_ALL_CREDENTIALS, CRED_FLAGS, CRED_PERSIST_LOCAL_MACHINE, CRED_TYPE_GENERIC,
+        CredDeleteW, CredEnumerateW, CredFree, CredReadW, CredWriteW, CREDENTIALW, CRED_FLAGS,
+        CRED_PERSIST_LOCAL_MACHINE, CRED_TYPE_GENERIC,
     };
 
     fn target_name(secret: &str) -> Vec<u16> {
@@ -500,12 +500,9 @@ pub mod windows {
             unsafe {
                 let mut count: u32 = 0;
                 let mut ptr: *mut *mut CREDENTIALW = std::ptr::null_mut();
-                match CredEnumerateW(
-                    PWSTR(filter.as_ptr() as *mut _),
-                    Some(CRED_ENUMERATE_ALL_CREDENTIALS),
-                    &mut count,
-                    &mut ptr,
-                ) {
+                // No flags: CRED_ENUMERATE_ALL_CREDENTIALS requires a null
+                // filter, and we want the filter.
+                match CredEnumerateW(PWSTR(filter.as_ptr() as *mut _), None, &mut count, &mut ptr) {
                     Ok(()) => {}
                     // An empty store, or nothing matching the filter, comes
                     // back as ERROR_NOT_FOUND rather than a zero count.

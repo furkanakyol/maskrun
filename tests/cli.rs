@@ -174,7 +174,11 @@ fn keyring_list_shows_name_not_value() {
     let value = random_value();
     let secret = store(value.as_bytes());
     let listed = run(&["list"], &[], None);
-    assert!(listed.status.success());
+    assert!(
+        listed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&listed.stderr)
+    );
     let out = String::from_utf8_lossy(&listed.stdout);
     assert!(out.contains(&secret.name));
     assert!(!out.contains(&value));

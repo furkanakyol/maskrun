@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.85"
 description = "Run commands with secrets from your OS keyring, without leaking them into an AI agent's context."
-license = "MIT"
+license = "GPL-3.0-or-later"
 default-run = "maskrun"
 
 [dependencies]
