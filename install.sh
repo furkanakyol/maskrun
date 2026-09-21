@@ -32,7 +32,6 @@ fetch() {
     fi
 }
 
-# --- platform ----------------------------------------------------------------
 OS="$(uname -s)"
 ARCH="$(uname -m)"
 case "$OS" in
@@ -53,7 +52,6 @@ TARGET="${arch_part}-${os_part}"
 WORKDIR="$(mktemp -d)"
 trap 'rm -rf "$WORKDIR"' EXIT INT TERM
 
-# --- version -------------------------------------------------------------
 VERSION="${MASKRUN_VERSION:-}"
 if [ -z "$VERSION" ]; then
     fetch "$API_URL" "$WORKDIR/latest.json" || die "could not reach $API_URL to find the latest version"
@@ -65,16 +63,13 @@ ASSET="maskrun-${VERSION}-${TARGET}.tar.gz"
 ARCHIVE="$WORKDIR/$ASSET"
 SUMS="$WORKDIR/SHA256SUMS"
 
-# --- download --------------------------------------------------------------
 fetch "$BASE_URL/download/$VERSION/$ASSET" "$ARCHIVE" \
     || die "download failed: $BASE_URL/download/$VERSION/$ASSET"
 fetch "$BASE_URL/download/$VERSION/SHA256SUMS" "$SUMS" \
     || die "download failed: $BASE_URL/download/$VERSION/SHA256SUMS"
 
-# --- checksum ----------------------------------------------------------------
-# This is what replaces the old release's `ast.parse` sanity check: the one
-# thing standing between a tampered or truncated download and a secret
-# manager landing on disk. Not optional, not warn-and-continue.
+# The one thing standing between a tampered or truncated download and a
+# secret manager landing on disk. Not optional, not warn-and-continue.
 EXPECTED="$(awk -v f="$ASSET" '{fn=$2; sub(/^\*/, "", fn); if (fn == f) print $1}' "$SUMS")"
 [ -n "$EXPECTED" ] || die "SHA256SUMS has no entry for $ASSET"
 
@@ -91,7 +86,6 @@ fi
   actual:   $ACTUAL
 The download is corrupted or was tampered with. Not installing."
 
-# --- install ---------------------------------------------------------------
 tar -xzf "$ARCHIVE" -C "$WORKDIR" maskrun
 mkdir -p "$BIN_DIR"
 install -m 755 "$WORKDIR/maskrun" "$BIN_DIR/maskrun"
@@ -100,7 +94,6 @@ VERSION_OUTPUT="$("$BIN_DIR/maskrun" --version 2>/dev/null)" \
     || die "installed but did not run: $BIN_DIR/maskrun --version"
 say "installed $VERSION_OUTPUT -> $BIN_DIR/maskrun"
 
-# --- PATH ------------------------------------------------------------------
 case ":$PATH:" in
     *":$BIN_DIR:"*) ;;
     *)
@@ -110,7 +103,6 @@ case ":$PATH:" in
         ;;
 esac
 
-# --- optional guard ----------------------------------------------------------
 if [ "${MASKRUN_WITH_GUARD:-0}" = "1" ]; then
     say ""
     "$BIN_DIR/maskrun" install-guard || \

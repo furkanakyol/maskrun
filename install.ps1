@@ -23,7 +23,6 @@ $exe     = Join-Path $binDir 'maskrun.exe'
 
 function Fail($message) { Write-Error "error: $message"; exit 1 }
 
-# --- version -------------------------------------------------------------
 $version = $env:MASKRUN_VERSION
 if (-not $version) {
     try {
@@ -42,7 +41,6 @@ $archive = Join-Path $workDir $asset
 $sums    = Join-Path $workDir 'SHA256SUMS'
 
 try {
-    # --- download ----------------------------------------------------------
     try {
         Invoke-WebRequest -Uri "$baseUrl/download/$version/$asset" -OutFile $archive -UseBasicParsing
         Invoke-WebRequest -Uri "$baseUrl/download/$version/SHA256SUMS" -OutFile $sums -UseBasicParsing
@@ -50,10 +48,8 @@ try {
         Fail "download failed: $($_.Exception.Message)"
     }
 
-    # --- checksum ------------------------------------------------------------
-    # Replaces the old release's `ast.parse` sanity check: the one thing
-    # standing between a tampered or truncated download and a secret manager
-    # landing on disk. Not optional, not warn-and-continue.
+    # The one thing standing between a tampered or truncated download and a
+    # secret manager landing on disk. Not optional, not warn-and-continue.
     $expectedLine = Select-String -Path $sums -Pattern ([regex]::Escape($asset)) | Select-Object -First 1
     if (-not $expectedLine) { Fail "SHA256SUMS has no entry for $asset" }
     $expected = ($expectedLine.Line -split '\s+')[0].TrimStart('*')
@@ -62,7 +58,6 @@ try {
         Fail "checksum mismatch for $asset`n  expected: $expected`n  actual:   $actual`nThe download is corrupted or was tampered with. Not installing."
     }
 
-    # --- install -------------------------------------------------------------
     Expand-Archive -Path $archive -DestinationPath $workDir -Force
     New-Item -ItemType Directory -Force -Path $binDir | Out-Null
     Copy-Item -Path (Join-Path $workDir 'maskrun.exe') -Destination $exe -Force
@@ -74,7 +69,6 @@ $versionOutput = & $exe --version
 if ($LASTEXITCODE -ne 0) { Fail "installed but did not run: $exe --version" }
 Write-Host "installed $versionOutput -> $exe"
 
-# --- PATH ------------------------------------------------------------------
 $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
 if ($userPath -notlike "*$binDir*") {
     Write-Host ""
@@ -83,7 +77,6 @@ if ($userPath -notlike "*$binDir*") {
     Write-Host "    [Environment]::SetEnvironmentVariable('Path', `"$binDir;`" + [Environment]::GetEnvironmentVariable('Path','User'), 'User')"
 }
 
-# --- optional guard ----------------------------------------------------------
 if ($env:MASKRUN_WITH_GUARD -eq '1') {
     Write-Host ""
     & $exe install-guard
