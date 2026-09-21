@@ -236,15 +236,23 @@ fn version_and_help_exit_cleanly() {
 }
 
 #[test]
-fn double_dash_argv_split_reaches_stub_command() {
-    // Reaching "not yet implemented" (not the "not a VAR=secret-name pair"
-    // error) proves the split before -- was right despite exec being a stub.
-    let result = run(&["exec", "FOO=x", "--", "echo", "hi"], &[], None);
-    assert_eq!(result.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&result.stderr).contains("not yet implemented"));
+fn double_dash_argv_split_reaches_real_command() {
+    // If the split before `--` were wrong, "hi" would end up in the
+    // assignment list and fail with "expected VAR=secret-name" before
+    // collect() ever runs. Failing on "half-filled" instead proves the
+    // assignment was exactly `FOO=<absent>` and the command was `echo hi`.
+    let absent = format!("FOO=maskrun-absent-{}", unique_suffix());
+    let result = run(&["exec", &absent, "--", "echo", "hi"], &[], None);
+    assert!(!result.status.success());
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(stderr.contains("half-filled"), "{stderr}");
+    assert!(!stderr.contains("expected VAR=secret-name"));
 
-    // Only the first -- splits; a second -- stays part of the command.
-    let result = run(&["run", "--", "echo", "--", "--flag"], &[], None);
-    assert_eq!(result.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&result.stderr).contains("not yet implemented"));
+    // Only the first -- splits; a second -- stays part of the command, so
+    // `echo` sees it as a literal argument and prints it back.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join(".maskrun"), "").unwrap();
+    let result = run_in(Some(dir.path()), &["run", "--", "echo", "hi", "--", "--flag"], &[], None);
+    assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+    assert_eq!(String::from_utf8_lossy(&result.stdout).trim_end(), "hi -- --flag");
 }
