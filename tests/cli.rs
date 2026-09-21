@@ -275,8 +275,14 @@ fn double_dash_argv_split_reaches_real_command() {
     let result = run(&["exec", &absent, "--", "echo", "hi"], &[], None);
     assert!(!result.status.success());
     let stderr = String::from_utf8_lossy(&result.stderr);
+    // These two hold whether or not a keyring is reachable: both are parse
+    // errors that would fire before any backend is touched.
+    assert!(!stderr.contains("expected VAR=secret-name"), "{stderr}");
+    assert!(!stderr.contains("nothing to run"), "{stderr}");
+    if !require_keyring() {
+        return;
+    }
     assert!(stderr.contains("half-filled"), "{stderr}");
-    assert!(!stderr.contains("expected VAR=secret-name"));
 
     // Only the first -- splits; a second -- stays part of the command, so
     // `echo` sees it as a literal argument and prints it back.
