@@ -51,7 +51,11 @@ struct IsolatedSession {
 
 impl IsolatedSession {
     fn start() -> Option<Self> {
-        if !have("dbus-daemon") || !have("gnome-keyring-daemon") || !have("secret-tool") || !have("timeout") {
+        if !have("dbus-daemon")
+            || !have("gnome-keyring-daemon")
+            || !have("secret-tool")
+            || !have("timeout")
+        {
             eprintln!("skipping: dbus-daemon/gnome-keyring-daemon/secret-tool/timeout not on PATH");
             return None;
         }
@@ -71,7 +75,14 @@ impl IsolatedSession {
         // --fork so this call returns once the bus is up, handing back its
         // address and pid instead of a session we'd have to babysit.
         let out = Command::new("timeout")
-            .args(["5", "dbus-daemon", "--session", "--fork", "--print-address", "--print-pid"])
+            .args([
+                "5",
+                "dbus-daemon",
+                "--session",
+                "--fork",
+                "--print-address",
+                "--print-pid",
+            ])
             .env_remove("DISPLAY")
             .env_remove("WAYLAND_DISPLAY")
             .output()
@@ -84,7 +95,14 @@ impl IsolatedSession {
         let bus_address = lines.next()?.trim().to_string();
         let dbus_pid = lines.next()?.trim().to_string();
 
-        let session = Self { _work: work, runtime_dir, home_dir, control_dir, bus_address, dbus_pid };
+        let session = Self {
+            _work: work,
+            runtime_dir,
+            home_dir,
+            control_dir,
+            bus_address,
+            dbus_pid,
+        };
 
         // --control-directory is what keeps this off the real
         // $XDG_RUNTIME_DIR/keyring: gnome-keyring-daemon otherwise discovers
@@ -92,7 +110,10 @@ impl IsolatedSession {
         // has, regardless of DBUS_SESSION_BUS_ADDRESS.
         let mut daemon = Command::new("gnome-keyring-daemon")
             .args(["--start", "--components=secrets"])
-            .arg(format!("--control-directory={}", session.control_dir.display()))
+            .arg(format!(
+                "--control-directory={}",
+                session.control_dir.display()
+            ))
             .envs(session.env())
             .env_remove("DISPLAY")
             .env_remove("WAYLAND_DISPLAY")
@@ -118,11 +139,26 @@ impl IsolatedSession {
         // seconds) rather than fail fast, which turned 30 quick retries into
         // a multi-minute hang the first time this ran without it.
         for _ in 0..30 {
-            let stored = secret_tool(&["store", "--label=warmup", "service", "maskrun-lock-test", "name", "warmup"], &session.env(), Some(b"warmup"))
-                .map(|s| s.success())
-                .unwrap_or(false);
+            let stored = secret_tool(
+                &[
+                    "store",
+                    "--label=warmup",
+                    "service",
+                    "maskrun-lock-test",
+                    "name",
+                    "warmup",
+                ],
+                &session.env(),
+                Some(b"warmup"),
+            )
+            .map(|s| s.success())
+            .unwrap_or(false);
             if stored {
-                let _ = secret_tool(&["clear", "service", "maskrun-lock-test", "name", "warmup"], &session.env(), None);
+                let _ = secret_tool(
+                    &["clear", "service", "maskrun-lock-test", "name", "warmup"],
+                    &session.env(),
+                    None,
+                );
                 return Some(session);
             }
             std::thread::sleep(Duration::from_secs(1));
@@ -145,7 +181,10 @@ impl IsolatedSession {
 
     fn lock(&self) {
         let status = secret_tool(&["lock"], &self.env(), None);
-        assert!(status.map(|s| s.success()).unwrap_or(false), "secret-tool lock failed");
+        assert!(
+            status.map(|s| s.success()).unwrap_or(false),
+            "secret-tool lock failed"
+        );
     }
 }
 
@@ -153,7 +192,11 @@ impl IsolatedSession {
 // wedged D-Bus service it can block for its own multi-second method-call
 // timeout instead of failing fast, and the warmup loop above depends on
 // failures being fast to stay bounded.
-fn secret_tool(args: &[&str], env: &[(&'static str, String)], stdin_data: Option<&[u8]>) -> Option<std::process::ExitStatus> {
+fn secret_tool(
+    args: &[&str],
+    env: &[(&'static str, String)],
+    stdin_data: Option<&[u8]>,
+) -> Option<std::process::ExitStatus> {
     let mut cmd = Command::new("timeout");
     cmd.arg("5").arg("secret-tool").args(args);
     for (k, v) in env {
@@ -220,7 +263,12 @@ struct RunOpts<'a> {
 
 impl Default for RunOpts<'_> {
     fn default() -> Self {
-        RunOpts { cwd: None, stdin: None, no_unlock: true, strip_display: false }
+        RunOpts {
+            cwd: None,
+            stdin: None,
+            no_unlock: true,
+            strip_display: false,
+        }
     }
 }
 
@@ -267,10 +315,16 @@ fn run_maskrun(session: &IsolatedSession, args: &[&str], opts: RunOpts) -> Outpu
             let mut stderr = Vec::new();
             let _ = child.stdout.take().unwrap().read_to_end(&mut stdout);
             let _ = child.stderr.take().unwrap().read_to_end(&mut stderr);
-            return Output { status, stdout, stderr };
+            return Output {
+                status,
+                stdout,
+                stderr,
+            };
         }
         if Instant::now() >= deadline {
-            let _ = Command::new("kill").args(["-9", &child.id().to_string()]).status();
+            let _ = Command::new("kill")
+                .args(["-9", &child.id().to_string()])
+                .status();
             panic!(
                 "maskrun did not exit within 15s — an unlock attempt that never returns is \
                  exactly the regression this test guards against"
@@ -281,14 +335,22 @@ fn run_maskrun(session: &IsolatedSession, args: &[&str], opts: RunOpts) -> Outpu
 }
 
 fn text(out: &Output) -> String {
-    format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr))
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    )
 }
 
 fn put_secret(session: &IsolatedSession, name: &str, value: &[u8]) {
     let out = run_maskrun(
         session,
         &["put", name, "--stdin"],
-        RunOpts { stdin: Some(value), no_unlock: false, ..Default::default() },
+        RunOpts {
+            stdin: Some(value),
+            no_unlock: false,
+            ..Default::default()
+        },
     );
     assert!(out.status.success(), "setup: put failed: {}", text(&out));
 }
@@ -305,17 +367,26 @@ fn locked_collection_is_reported_as_locked_not_empty() {
         return;
     }
 
-    let Some(session) = IsolatedSession::start() else { return };
+    let Some(session) = IsolatedSession::start() else {
+        return;
+    };
     let name = format!("maskrun-lock-test-{}", unique_suffix());
     put_secret(&session, &name, b"locked-vault-value");
 
     let listed = run_maskrun(&session, &["list"], RunOpts::default());
-    assert!(text(&listed).contains(&name), "sanity: unlocked list should show the secret");
+    assert!(
+        text(&listed).contains(&name),
+        "sanity: unlocked list should show the secret"
+    );
 
     session.lock();
 
     let manifest_dir = tempfile::tempdir().unwrap();
-    std::fs::write(manifest_dir.path().join(".maskrun"), format!("TEST_VAR={name}\n")).unwrap();
+    std::fs::write(
+        manifest_dir.path().join(".maskrun"),
+        format!("TEST_VAR={name}\n"),
+    )
+    .unwrap();
 
     let list = run_maskrun(&session, &["list"], RunOpts::default());
     let list_text = text(&list);
@@ -326,7 +397,10 @@ fn locked_collection_is_reported_as_locked_not_empty() {
     let status = run_maskrun(
         &session,
         &["status"],
-        RunOpts { cwd: Some(manifest_dir.path()), ..Default::default() },
+        RunOpts {
+            cwd: Some(manifest_dir.path()),
+            ..Default::default()
+        },
     );
     let status_text = text(&status);
     assert!(!status.status.success());
@@ -337,7 +411,10 @@ fn locked_collection_is_reported_as_locked_not_empty() {
     let run = run_maskrun(
         &session,
         &["run", "--raw", "--", "true"],
-        RunOpts { cwd: Some(manifest_dir.path()), ..Default::default() },
+        RunOpts {
+            cwd: Some(manifest_dir.path()),
+            ..Default::default()
+        },
     );
     let run_text = text(&run);
     assert!(!run.status.success());
@@ -363,12 +440,21 @@ fn put_on_a_locked_collection_gives_the_locked_message_not_a_raw_dbus_error() {
         return;
     }
 
-    let Some(session) = IsolatedSession::start() else { return };
+    let Some(session) = IsolatedSession::start() else {
+        return;
+    };
     let name = format!("maskrun-lock-test-{}", unique_suffix());
     put_secret(&session, &name, b"pre-existing");
     session.lock();
 
-    let out = run_maskrun(&session, &["put", &name, "--stdin"], RunOpts { stdin: Some(b"new-value"), ..Default::default() });
+    let out = run_maskrun(
+        &session,
+        &["put", &name, "--stdin"],
+        RunOpts {
+            stdin: Some(b"new-value"),
+            ..Default::default()
+        },
+    );
     let msg = text(&out);
     assert!(!out.status.success());
     assert!(msg.contains("locked"), "{msg}");
@@ -389,7 +475,9 @@ fn locked_collection_without_a_display_fails_fast_without_the_opt_out() {
         return;
     }
 
-    let Some(session) = IsolatedSession::start() else { return };
+    let Some(session) = IsolatedSession::start() else {
+        return;
+    };
     let name = format!("maskrun-lock-test-{}", unique_suffix());
     put_secret(&session, &name, b"headless-value");
     session.lock();
@@ -398,7 +486,11 @@ fn locked_collection_without_a_display_fails_fast_without_the_opt_out() {
     let out = run_maskrun(
         &session,
         &["list"],
-        RunOpts { no_unlock: false, strip_display: true, ..Default::default() },
+        RunOpts {
+            no_unlock: false,
+            strip_display: true,
+            ..Default::default()
+        },
     );
     let elapsed = start.elapsed();
     let msg = text(&out);
@@ -408,7 +500,10 @@ fn locked_collection_without_a_display_fails_fast_without_the_opt_out() {
     // Generous margin over the immediate cancel this should actually take;
     // the real regression this guards against is the ~1 year default the
     // underlying crate documents for connect() without a bounded timeout.
-    assert!(elapsed < Duration::from_secs(5), "took {elapsed:?} — should fail immediately");
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "took {elapsed:?} — should fail immediately"
+    );
 }
 
 // A locked keyring reported by is_locked() elsewhere must not make an
@@ -421,7 +516,9 @@ fn unlocked_collection_behaves_normally_after_the_lock_handling_changes() {
         return;
     }
 
-    let Some(session) = IsolatedSession::start() else { return };
+    let Some(session) = IsolatedSession::start() else {
+        return;
+    };
     let name = format!("maskrun-lock-test-{}", unique_suffix());
     put_secret(&session, &name, b"still-fine");
 
@@ -430,8 +527,19 @@ fn unlocked_collection_behaves_normally_after_the_lock_handling_changes() {
     assert!(text(&list).contains(&name));
 
     let manifest_dir = tempfile::tempdir().unwrap();
-    std::fs::write(manifest_dir.path().join(".maskrun"), format!("TEST_VAR={name}\n")).unwrap();
-    let status = run_maskrun(&session, &["status"], RunOpts { cwd: Some(manifest_dir.path()), ..Default::default() });
+    std::fs::write(
+        manifest_dir.path().join(".maskrun"),
+        format!("TEST_VAR={name}\n"),
+    )
+    .unwrap();
+    let status = run_maskrun(
+        &session,
+        &["status"],
+        RunOpts {
+            cwd: Some(manifest_dir.path()),
+            ..Default::default()
+        },
+    );
     assert!(status.status.success(), "{}", text(&status));
     assert!(text(&status).contains("all 1 secret(s) present"));
 }

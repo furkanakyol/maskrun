@@ -25,8 +25,9 @@ pub trait Backend {
 pub fn check_name(secret: &str) -> Result<&str> {
     let mut chars = secret.chars();
     let ok = match chars.next() {
-        Some(c) if c.is_ascii_alphanumeric() => chars
-            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-'),
+        Some(c) if c.is_ascii_alphanumeric() => {
+            chars.all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
+        }
         _ => false,
     };
     if !ok {
@@ -68,7 +69,9 @@ fn secret_service_backend() -> Result<Box<dyn Backend>> {
 }
 #[cfg(not(target_os = "linux"))]
 fn secret_service_backend() -> Result<Box<dyn Backend>> {
-    Err(Error::msg("the secret-service backend is only available on Linux"))
+    Err(Error::msg(
+        "the secret-service backend is only available on Linux",
+    ))
 }
 
 #[cfg(target_os = "macos")]
@@ -77,7 +80,9 @@ fn keychain_backend() -> Result<Box<dyn Backend>> {
 }
 #[cfg(not(target_os = "macos"))]
 fn keychain_backend() -> Result<Box<dyn Backend>> {
-    Err(Error::msg("the keychain backend is only available on macOS"))
+    Err(Error::msg(
+        "the keychain backend is only available on macOS",
+    ))
 }
 
 #[cfg(target_os = "windows")]
@@ -86,7 +91,9 @@ fn credential_manager_backend() -> Result<Box<dyn Backend>> {
 }
 #[cfg(not(target_os = "windows"))]
 fn credential_manager_backend() -> Result<Box<dyn Backend>> {
-    Err(Error::msg("the dpapi/credential-manager backend is only available on Windows"))
+    Err(Error::msg(
+        "the dpapi/credential-manager backend is only available on Windows",
+    ))
 }
 
 // Not the `keyring` crate: its default (v1/zbus) Secret Service store sets
@@ -454,8 +461,12 @@ pub mod windows {
             let target = target_name(secret);
             unsafe {
                 let mut ptr: *mut CREDENTIALW = std::ptr::null_mut();
-                match CredReadW(PWSTR(target.as_ptr() as *mut _), CRED_TYPE_GENERIC, None, &mut ptr)
-                {
+                match CredReadW(
+                    PWSTR(target.as_ptr() as *mut _),
+                    CRED_TYPE_GENERIC,
+                    None,
+                    &mut ptr,
+                ) {
                     Ok(()) => {
                         let cred = &*ptr;
                         let bytes = std::slice::from_raw_parts(
@@ -527,6 +538,9 @@ mod tests {
             return;
         };
         let locked = backend.is_locked();
-        assert!(locked.is_ok(), "is_locked() should report a state, not error: {locked:?}");
+        assert!(
+            locked.is_ok(),
+            "is_locked() should report a state, not error: {locked:?}"
+        );
     }
 }

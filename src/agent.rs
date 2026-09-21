@@ -112,7 +112,9 @@ mod tests {
         clear_agent_env();
         std::env::set_var("MASKRUN_AGENT", "1");
         let err = refuse_in_agent("maskrun get", "alt").unwrap_err();
-        assert!(err.to_string().contains("disabled inside an AI agent session"));
+        assert!(err
+            .to_string()
+            .contains("disabled inside an AI agent session"));
         clear_agent_env();
     }
 

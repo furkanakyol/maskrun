@@ -93,7 +93,11 @@ fn run_in(
 
 fn keyring_probe_available() -> bool {
     let probe = format!("maskrun-selftest-probe-{}", unique_suffix());
-    let put = run(&["put", &probe, "--stdin"], &[], Some(b"probe-value-long-enough"));
+    let put = run(
+        &["put", &probe, "--stdin"],
+        &[],
+        Some(b"probe-value-long-enough"),
+    );
     if !put.status.success() {
         return false;
     }
@@ -127,7 +131,11 @@ impl Drop for StoredSecret {
 fn store(value: &str) -> StoredSecret {
     let name = format!("maskrun-test-{}", unique_suffix());
     let out = run(&["put", &name, "--stdin"], &[], Some(value.as_bytes()));
-    assert!(out.status.success(), "put failed: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "put failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     StoredSecret { name }
 }
 
@@ -164,7 +172,11 @@ fn stdout_masked() {
         &[],
         None,
     );
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(!text.contains(&value));
     assert!(text.contains("<masked:TEST>"));
@@ -342,7 +354,14 @@ fn missing_secret_refuses_to_run() {
         return;
     }
     let out = run(
-        &["exec", &format!("GONE=maskrun-absent-{}", unique_suffix()), "--", "python3", "-c", "print(1)"],
+        &[
+            "exec",
+            &format!("GONE=maskrun-absent-{}", unique_suffix()),
+            "--",
+            "python3",
+            "-c",
+            "print(1)",
+        ],
         &[],
         None,
     );
@@ -368,7 +387,10 @@ fn get_refused_in_agent_session() {
 // --------------------------------------------------------------------------
 
 fn manifest_dir(secret_name: &str) -> tempfile::TempDir {
-    let dir = tempfile::Builder::new().prefix("maskrun-run-test-").tempdir().unwrap();
+    let dir = tempfile::Builder::new()
+        .prefix("maskrun-run-test-")
+        .tempdir()
+        .unwrap();
     std::fs::write(dir.path().join(".maskrun"), format!("TEST={secret_name}\n")).unwrap();
     dir
 }
@@ -383,11 +405,21 @@ fn run_injects_and_masks() {
     let dir = manifest_dir(&secret.name);
     let out = run_in(
         Some(dir.path()),
-        &["run", "--", "python3", "-c", "import os;print('run: ' + os.environ['TEST'])"],
+        &[
+            "run",
+            "--",
+            "python3",
+            "-c",
+            "import os;print('run: ' + os.environ['TEST'])",
+        ],
         &[],
         None,
     );
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(!text.contains(&value));
     assert!(text.contains("<masked:TEST>"));
@@ -403,11 +435,20 @@ fn bare_double_dash_is_run() {
     let dir = manifest_dir(&secret.name);
     let out = run_in(
         Some(dir.path()),
-        &["--", "python3", "-c", "import os;print('bare: ' + os.environ['TEST'])"],
+        &[
+            "--",
+            "python3",
+            "-c",
+            "import os;print('bare: ' + os.environ['TEST'])",
+        ],
         &[],
         None,
     );
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     assert!(String::from_utf8_lossy(&out.stdout).contains("<masked:TEST>"));
 }
 
@@ -441,9 +482,15 @@ struct ImportFixture {
 }
 
 fn import_fixture() -> ImportFixture {
-    let dir = tempfile::Builder::new().prefix("maskrun-import-test-").tempdir().unwrap();
+    let dir = tempfile::Builder::new()
+        .prefix("maskrun-import-test-")
+        .tempdir()
+        .unwrap();
     let values: Vec<(&'static str, String)> = vec![
-        ("DATABASE_URL", "postgres://u:p@h:5432/db?opt=a=b".to_string()),
+        (
+            "DATABASE_URL",
+            "postgres://u:p@h:5432/db?opt=a=b".to_string(),
+        ),
         ("JWT_SECRET", BASE64.encode(b"jwt-signing-material")),
         ("QUOTED", "value with spaces".to_string()),
         ("VITE_PUBLIC_URL", "https://example.com".to_string()),
@@ -457,15 +504,26 @@ fn import_fixture() -> ImportFixture {
     // ran, same as test_maskrun.py's TestImport.tearDown.
     let cleanup = values
         .iter()
-        .map(|(var, _)| StoredSecret { name: format!("imp-{}", var.to_lowercase().replace('_', "-")) })
+        .map(|(var, _)| StoredSecret {
+            name: format!("imp-{}", var.to_lowercase().replace('_', "-")),
+        })
         .collect();
-    ImportFixture { dir, values, _cleanup: cleanup }
+    ImportFixture {
+        dir,
+        values,
+        _cleanup: cleanup,
+    }
 }
 
 fn import_cmd(fixture: &ImportFixture, extra: &[&str]) -> Output {
     let mut args: Vec<&str> = vec!["import", ".env", "--prefix", "imp"];
     args.extend_from_slice(extra);
-    run_in(Some(fixture.dir.path()), &args, &[("MASKRUN_AGENT", "0")], None)
+    run_in(
+        Some(fixture.dir.path()),
+        &args,
+        &[("MASKRUN_AGENT", "0")],
+        None,
+    )
 }
 
 #[test]
@@ -486,7 +544,11 @@ fn import_dry_run_writes_nothing() {
     }
     let fixture = import_fixture();
     let out = import_cmd(&fixture, &["--dry-run"]);
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     assert!(!fixture.dir.path().join(".maskrun").exists());
     assert!(String::from_utf8_lossy(&out.stdout).contains("nothing was written"));
 }
@@ -498,7 +560,11 @@ fn import_preserves_values_and_skips_public() {
     }
     let fixture = import_fixture();
     let out = import_cmd(&fixture, &[]);
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     let manifest = std::fs::read_to_string(fixture.dir.path().join(".maskrun")).unwrap();
     assert!(manifest.contains("DATABASE_URL=imp-database-url"));
@@ -513,7 +579,11 @@ fn import_preserves_values_and_skips_public() {
         }
         let name = format!("imp-{}", var.to_lowercase().replace('_', "-"));
         let got = run(&["get", &name], &[("MASKRUN_ALLOW_READ", "1")], None);
-        assert!(got.status.success(), "{}", String::from_utf8_lossy(&got.stderr));
+        assert!(
+            got.status.success(),
+            "{}",
+            String::from_utf8_lossy(&got.stderr)
+        );
         let returned = String::from_utf8_lossy(&got.stdout);
         let returned = returned.strip_suffix('\n').unwrap_or(&returned);
         assert_eq!(

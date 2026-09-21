@@ -10,7 +10,9 @@ use crate::manifest;
 
 pub fn cmd_run(command: &[String], raw: bool, mask: bool, backend: &dyn Backend) -> Result<i32> {
     if command.is_empty() {
-        return Err(Error::msg("nothing to run. Usage: maskrun run -- <command>"));
+        return Err(Error::msg(
+            "nothing to run. Usage: maskrun run -- <command>",
+        ));
     }
     let path = manifest::require_manifest()?;
     let pairs = manifest::read_manifest(&path)?;
@@ -40,7 +42,10 @@ pub fn cmd_exec(
         let (var, secret) = item
             .split_once('=')
             .ok_or_else(|| Error::msg(format!("expected VAR=secret-name, got {item:?}")))?;
-        pairs.push((var.trim().to_string(), check_name(secret.trim())?.to_string()));
+        pairs.push((
+            var.trim().to_string(),
+            check_name(secret.trim())?.to_string(),
+        ));
     }
     let injected = collect(&pairs, backend)?;
     dispatch(command, injected, raw, mask)
@@ -165,7 +170,10 @@ mod tests {
 
     #[test]
     fn collect_refuses_half_filled_environment() {
-        let backend = FakeBackend { values: HashMap::from([("present", "value")]), ..Default::default() };
+        let backend = FakeBackend {
+            values: HashMap::from([("present", "value")]),
+            ..Default::default()
+        };
         let pairs = vec![
             ("A".to_string(), "present".to_string()),
             ("B".to_string(), "absent".to_string()),
@@ -211,7 +219,10 @@ mod tests {
 
     #[test]
     fn collect_treats_empty_value_as_missing() {
-        let backend = FakeBackend { values: HashMap::from([("empty", "")]), ..Default::default() };
+        let backend = FakeBackend {
+            values: HashMap::from([("empty", "")]),
+            ..Default::default()
+        };
         let pairs = vec![("A".to_string(), "empty".to_string())];
         let err = collect(&pairs, &backend).unwrap_err();
         assert!(err.to_string().contains("half-filled"));
@@ -219,7 +230,10 @@ mod tests {
 
     #[test]
     fn collect_succeeds_when_everything_present() {
-        let backend = FakeBackend { values: HashMap::from([("present", "value")]), ..Default::default() };
+        let backend = FakeBackend {
+            values: HashMap::from([("present", "value")]),
+            ..Default::default()
+        };
         let pairs = vec![("A".to_string(), "present".to_string())];
         let injected = collect(&pairs, &backend).unwrap();
         assert_eq!(injected.get("A"), Some(&"value".to_string()));
@@ -227,7 +241,10 @@ mod tests {
 
     #[test]
     fn cmd_run_rejects_empty_command() {
-        let backend = FakeBackend { values: HashMap::new(), ..Default::default() };
+        let backend = FakeBackend {
+            values: HashMap::new(),
+            ..Default::default()
+        };
         let err = cmd_run(&[], false, false, &backend).unwrap_err();
         assert!(matches!(err, MaskrunError::User(_)));
         assert!(err.to_string().contains("nothing to run"));
@@ -235,15 +252,20 @@ mod tests {
 
     #[test]
     fn cmd_exec_rejects_missing_assignment() {
-        let backend = FakeBackend { values: HashMap::new(), ..Default::default() };
-        let err =
-            cmd_exec(&[], &["echo".to_string()], false, false, &backend).unwrap_err();
+        let backend = FakeBackend {
+            values: HashMap::new(),
+            ..Default::default()
+        };
+        let err = cmd_exec(&[], &["echo".to_string()], false, false, &backend).unwrap_err();
         assert!(err.to_string().contains("no VAR=secret-name given"));
     }
 
     #[test]
     fn cmd_exec_rejects_malformed_assignment() {
-        let backend = FakeBackend { values: HashMap::new(), ..Default::default() };
+        let backend = FakeBackend {
+            values: HashMap::new(),
+            ..Default::default()
+        };
         let err = cmd_exec(
             &["not-an-assignment".to_string()],
             &["echo".to_string()],

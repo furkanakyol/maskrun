@@ -67,7 +67,11 @@ enum Command {
         raw: bool,
         #[arg(long, help = "always mask output")]
         mask: bool,
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true, help = "VAR=secret-name")]
+        #[arg(
+            trailing_var_arg = true,
+            allow_hyphen_values = true,
+            help = "VAR=secret-name"
+        )]
         assignment: Vec<String>,
     },
     #[command(about = "move a .env into the keyring")]
@@ -77,22 +81,35 @@ enum Command {
         prefix: Option<String>,
         #[arg(long = "dry-run", help = "write nothing")]
         dry_run: bool,
-        #[arg(long, help = "also import client-bundled vars (VITE_, NEXT_PUBLIC_, ...)")]
+        #[arg(
+            long,
+            help = "also import client-bundled vars (VITE_, NEXT_PUBLIC_, ...)"
+        )]
         all: bool,
     },
     #[command(about = "PreToolUse guard for agent harnesses (reads JSON on stdin)")]
     Hook,
     #[command(about = "add the guard hook to an agent harness's config")]
     InstallGuard {
-        #[arg(long, default_value = "claude-code", help = "which harness (default: claude-code)")]
+        #[arg(
+            long,
+            default_value = "claude-code",
+            help = "which harness (default: claude-code)"
+        )]
         harness: String,
         #[arg(long, help = "uninstall instead")]
         remove: bool,
         #[arg(long = "dry-run", help = "print, write nothing")]
         dry_run: bool,
-        #[arg(long, help = "settings file to edit (default: ~/.claude/settings.json)")]
+        #[arg(
+            long,
+            help = "settings file to edit (default: ~/.claude/settings.json)"
+        )]
         config: Option<String>,
-        #[arg(long = "command-path", help = "how to invoke maskrun (default: 'maskrun')")]
+        #[arg(
+            long = "command-path",
+            help = "how to invoke maskrun (default: 'maskrun')"
+        )]
         command_path: Option<String>,
     },
 }

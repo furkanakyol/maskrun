@@ -115,7 +115,11 @@ pub fn build_filter(pairs: &[(String, String)]) -> Option<FilterSpec> {
         .join("|");
     let pattern = Regex::new(&pattern).expect("escaped literal alternation must compile");
 
-    Some(FilterSpec { pattern, table, line_safe })
+    Some(FilterSpec {
+        pattern,
+        table,
+        line_safe,
+    })
 }
 
 struct StreamPump<R: Read, W: Write> {
@@ -177,8 +181,10 @@ impl<R: Read, W: Write> StreamPump<R, W> {
 }
 
 pub fn run_masked(command: &[String], mut injected: HashMap<String, String>) -> Result<i32> {
-    let pairs: Vec<(String, String)> =
-        injected.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    let pairs: Vec<(String, String)> = injected
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
     let Some(spec) = build_filter(&pairs) else {
         let code = crate::run::exec_with_env(command, &injected);
         for value in injected.values_mut() {
@@ -211,13 +217,23 @@ pub fn run_masked(command: &[String], mut injected: HashMap<String, String>) -> 
 
     let out_spec = Arc::clone(&spec);
     let out_thread = std::thread::spawn(move || {
-        StreamPump { source: stdout, sink: std::io::stdout(), spec: out_spec, buffer: Vec::new() }
-            .pump()
+        StreamPump {
+            source: stdout,
+            sink: std::io::stdout(),
+            spec: out_spec,
+            buffer: Vec::new(),
+        }
+        .pump()
     });
     let err_spec = Arc::clone(&spec);
     let err_thread = std::thread::spawn(move || {
-        StreamPump { source: stderr, sink: std::io::stderr(), spec: err_spec, buffer: Vec::new() }
-            .pump()
+        StreamPump {
+            source: stderr,
+            sink: std::io::stderr(),
+            spec: err_spec,
+            buffer: Vec::new(),
+        }
+        .pump()
     });
 
     let status = child.wait()?;
@@ -267,7 +283,10 @@ mod tests {
 
     #[test]
     fn filter_masks_longest_variant_first() {
-        let pairs = vec![("A".into(), "sixchr".to_string()), ("B".into(), "sixchrlonger".to_string())];
+        let pairs = vec![
+            ("A".into(), "sixchr".to_string()),
+            ("B".into(), "sixchrlonger".to_string()),
+        ];
         let spec = build_filter(&pairs).unwrap();
         let masked = spec.pattern.replace_all(b"sixchrlonger", |c: &Captures| {
             spec.table.get(&c[0]).cloned().unwrap_or_default()
@@ -301,14 +320,22 @@ mod tests {
         let spec = Arc::new(build_filter(&[("TEST".into(), value.into())]).unwrap());
         let (first, second) = value.split_at(10);
         let reader = ChunkedReader {
-            chunks: [format!("head {first}").into_bytes(), format!("{second} tail\n").into_bytes()]
-                .into_iter()
-                .collect(),
+            chunks: [
+                format!("head {first}").into_bytes(),
+                format!("{second} tail\n").into_bytes(),
+            ]
+            .into_iter()
+            .collect(),
         };
         let mut sink = Vec::new();
-        StreamPump { source: reader, sink: &mut sink, spec, buffer: Vec::new() }
-            .pump()
-            .unwrap();
+        StreamPump {
+            source: reader,
+            sink: &mut sink,
+            spec,
+            buffer: Vec::new(),
+        }
+        .pump()
+        .unwrap();
         let out = String::from_utf8(sink).unwrap();
         assert!(!out.contains(value));
         assert!(out.contains("<masked:TEST>"));
@@ -322,12 +349,19 @@ mod tests {
         let spec = Arc::new(build_filter(&[("TEST".into(), value.into())]).unwrap());
         let (first, second) = value.split_at(10);
         let reader = ChunkedReader {
-            chunks: [first.as_bytes().to_vec(), second.as_bytes().to_vec()].into_iter().collect(),
+            chunks: [first.as_bytes().to_vec(), second.as_bytes().to_vec()]
+                .into_iter()
+                .collect(),
         };
         let mut sink = Vec::new();
-        StreamPump { source: reader, sink: &mut sink, spec, buffer: Vec::new() }
-            .pump()
-            .unwrap();
+        StreamPump {
+            source: reader,
+            sink: &mut sink,
+            spec,
+            buffer: Vec::new(),
+        }
+        .pump()
+        .unwrap();
         let out = String::from_utf8(sink).unwrap();
         assert!(!out.contains(value));
         assert!(out.contains("<masked:TEST>"));

@@ -30,7 +30,8 @@ const SEPARATORS: &[&str] = &["|", "||", "&&", ";", "&", "|&"];
 const REASON_MASKRUN_GET: &str = "`maskrun get` prints the value to stdout, which lands directly in the transcript. To USE a secret: `maskrun run -- <command>` or `maskrun exec VAR=name -- <command>`. To see what exists: `maskrun list`.";
 const REASON_MASKRUN_IMPORT: &str = "`maskrun import` reads the whole .env, so its contents enter the transcript. Let the human run this in their own terminal.";
 const REASON_SECRET_TOOL: &str = "`secret-tool lookup/search` reads the keyring directly and prints the value. Use `maskrun list` for names.";
-const REASON_SECURITY_FIND: &str = "`security find-generic-password` prints the keychain value. Use `maskrun list` for names.";
+const REASON_SECURITY_FIND: &str =
+    "`security find-generic-password` prints the keychain value. Use `maskrun list` for names.";
 const REASON_RAW: &str = "`--raw` turns output masking off, so a secret can leak into the transcript. Drop the flag — masking is automatic in an agent session.";
 const REASON_MASK_ZERO: &str = "MASKRUN_MASK=0 turns output masking off. Do not set it.";
 const REASON_ALLOW_READ: &str = "MASKRUN_ALLOW_READ=1 re-enables `maskrun get` inside an agent session, which defeats the guard.";
@@ -87,7 +88,9 @@ fn split_segment(segment: &[String]) -> (&[String], String, &[String]) {
     let mut idx = 0;
     while idx < segment.len() {
         let word = &segment[idx];
-        if env_assign_pattern().is_match(word) || matches!(word.as_str(), "sudo" | "command" | "exec" | "time") {
+        if env_assign_pattern().is_match(word)
+            || matches!(word.as_str(), "sudo" | "command" | "exec" | "time")
+        {
             idx += 1;
             continue;
         }
@@ -105,7 +108,8 @@ fn split_segment(segment: &[String]) -> (&[String], String, &[String]) {
 // back from a shlex.split ValueError — malformed input must never crash the
 // guard into blocking (or failing to check) everything.
 fn shlex_split(command: &str) -> Vec<String> {
-    try_shlex_split(command).unwrap_or_else(|| command.split_whitespace().map(String::from).collect())
+    try_shlex_split(command)
+        .unwrap_or_else(|| command.split_whitespace().map(String::from).collect())
 }
 
 fn try_shlex_split(command: &str) -> Option<Vec<String>> {
@@ -229,7 +233,12 @@ fn segment_rule_reason(segment: &[String]) -> Option<&'static str> {
             _ => {}
         }
     }
-    if name == "secret-tool" && matches!(args.first().map(String::as_str), Some("lookup") | Some("search")) {
+    if name == "secret-tool"
+        && matches!(
+            args.first().map(String::as_str),
+            Some("lookup") | Some("search")
+        )
+    {
         return Some(REASON_SECRET_TOOL);
     }
     if name == "security" && args.first().map(String::as_str) == Some("find-generic-password") {
@@ -248,7 +257,10 @@ fn segment_rule_reason(segment: &[String]) -> Option<&'static str> {
         return Some(REASON_BARE_ENV);
     }
     if matches!(name.as_str(), "get-childitem" | "gci" | "ls" | "dir")
-        && args.first().map(|w| w.to_lowercase().starts_with("env:")).unwrap_or(false)
+        && args
+            .first()
+            .map(|w| w.to_lowercase().starts_with("env:"))
+            .unwrap_or(false)
     {
         return Some(REASON_POWERSHELL_ENV);
     }
@@ -261,7 +273,11 @@ fn reads_env_file(command: &str) -> Option<String> {
         if !READERS.contains(&name.as_str()) {
             continue;
         }
-        let raw_args: &[String] = if segment.len() > 1 { &segment[1..] } else { &[] };
+        let raw_args: &[String] = if segment.len() > 1 {
+            &segment[1..]
+        } else {
+            &[]
+        };
         let args = if PATTERN_READERS.contains(&name.as_str()) {
             drop_pattern_argument(raw_args)
         } else {
@@ -284,7 +300,10 @@ fn reads_env_file(command: &str) -> Option<String> {
 }
 
 fn guard_decision(payload: &Value) -> Option<String> {
-    let tool = payload.get("tool_name").and_then(Value::as_str).unwrap_or("");
+    let tool = payload
+        .get("tool_name")
+        .and_then(Value::as_str)
+        .unwrap_or("");
 
     if tool == "Bash" || tool == "BashOutput" {
         let command = payload
@@ -361,7 +380,12 @@ mod tests {
     fn allows_maskrun_get_mentioned_in_another_commands_argument() {
         assert!(decide("Bash", "command", "sed 's/maskrun get/x/' notes.md").is_none());
         assert!(decide("Bash", "command", "grep -r \"maskrun get\" docs/").is_none());
-        assert!(decide("Bash", "command", "echo \"run maskrun get in your own terminal\"").is_none());
+        assert!(decide(
+            "Bash",
+            "command",
+            "echo \"run maskrun get in your own terminal\""
+        )
+        .is_none());
     }
 
     #[test]
@@ -371,7 +395,12 @@ mod tests {
 
     #[test]
     fn blocks_mask_zero_env_assignment_prefix() {
-        assert!(decide("Bash", "command", "MASKRUN_MASK=0 maskrun run -- npm run dev").is_some());
+        assert!(decide(
+            "Bash",
+            "command",
+            "MASKRUN_MASK=0 maskrun run -- npm run dev"
+        )
+        .is_some());
     }
 
     #[test]

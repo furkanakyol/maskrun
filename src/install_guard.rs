@@ -71,7 +71,10 @@ pub fn cmd_install_guard(args: InstallGuardArgs<'_>) -> Result<i32> {
             match serde_json::from_str::<Value>(trimmed) {
                 Ok(v) if v.is_object() => v,
                 Ok(_) => {
-                    return Err(Error::msg(format!("{} does not contain a JSON object", path.display())));
+                    return Err(Error::msg(format!(
+                        "{} does not contain a JSON object",
+                        path.display()
+                    )));
                 }
                 Err(e) => {
                     return Err(Error::msg(format!(
@@ -88,14 +91,21 @@ pub fn cmd_install_guard(args: InstallGuardArgs<'_>) -> Result<i32> {
     };
 
     let settings_obj = settings.as_object_mut().expect("checked above");
-    let hooks_val = settings_obj.entry("hooks").or_insert_with(|| Value::Object(Map::new()));
+    let hooks_val = settings_obj
+        .entry("hooks")
+        .or_insert_with(|| Value::Object(Map::new()));
     let hooks_obj = hooks_val
         .as_object_mut()
         .ok_or_else(|| Error::msg(format!("{}: hooks is not an object", path.display())))?;
-    let pre_val = hooks_obj.entry("PreToolUse").or_insert_with(|| Value::Array(Vec::new()));
-    let pre = pre_val
-        .as_array_mut()
-        .ok_or_else(|| Error::msg(format!("{}: hooks.PreToolUse is not a list", path.display())))?;
+    let pre_val = hooks_obj
+        .entry("PreToolUse")
+        .or_insert_with(|| Value::Array(Vec::new()));
+    let pre = pre_val.as_array_mut().ok_or_else(|| {
+        Error::msg(format!(
+            "{}: hooks.PreToolUse is not a list",
+            path.display()
+        ))
+    })?;
 
     let existing: Vec<usize> = pre
         .iter()

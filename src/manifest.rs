@@ -10,8 +10,15 @@ pub const MANIFEST: &str = ".maskrun";
 
 // Client-bundled prefixes: these ship to the browser anyway, so they are
 // configuration, not secrets, and moving them buys nothing.
-const PUBLIC_PREFIXES: &[&str] =
-    &["VITE_", "NEXT_PUBLIC_", "PUBLIC_", "REACT_APP_", "NUXT_PUBLIC_", "EXPO_PUBLIC_", "GATSBY_"];
+const PUBLIC_PREFIXES: &[&str] = &[
+    "VITE_",
+    "NEXT_PUBLIC_",
+    "PUBLIC_",
+    "REACT_APP_",
+    "NUXT_PUBLIC_",
+    "EXPO_PUBLIC_",
+    "GATSBY_",
+];
 
 pub fn find_manifest(start: Option<&Path>) -> Result<Option<PathBuf>> {
     let mut dir: PathBuf = match start {
@@ -146,7 +153,10 @@ pub fn cmd_import(
 
     for (var, secret, value) in &rows {
         if dry_run {
-            println!("  {var:<28} -> {secret:<40} ({} chars)", value.chars().count());
+            println!(
+                "  {var:<28} -> {secret:<40} ({} chars)",
+                value.chars().count()
+            );
         } else {
             backend.put(secret, value)?;
             println!("  stored {var:<28} -> {secret}");
@@ -162,13 +172,18 @@ pub fn cmd_import(
         println!("Use --all to import them anyway.");
     }
 
-    let body: String =
-        rows.iter().map(|(var, secret, _)| format!("{var}={secret}\n")).collect();
+    let body: String = rows
+        .iter()
+        .map(|(var, secret, _)| format!("{var}={secret}\n"))
+        .collect();
     let header = "# maskrun manifest — secret NAMES, never values. Safe to commit.\n\
                   # Run commands with: maskrun run -- <command>\n";
 
     let result = if dry_run {
-        println!("\n--- {MANIFEST} that would be written ({} lines) ---", rows.len());
+        println!(
+            "\n--- {MANIFEST} that would be written ({} lines) ---",
+            rows.len()
+        );
         print!("{body}");
         println!("--- dry run: nothing was written ---");
         Ok(0)
@@ -229,7 +244,10 @@ mod tests {
         let deep = dir.path().join("a").join("b");
         std::fs::create_dir_all(&deep).unwrap();
         let found = find_manifest(Some(&deep)).unwrap();
-        assert_eq!(found.unwrap(), dir.path().canonicalize().unwrap().join(MANIFEST));
+        assert_eq!(
+            found.unwrap(),
+            dir.path().canonicalize().unwrap().join(MANIFEST)
+        );
     }
 
     #[test]

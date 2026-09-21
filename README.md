@@ -278,7 +278,8 @@ Agent sessions are detected from `CLAUDECODE`, `CLAUDE_CODE_ENTRYPOINT`,
 
 ## Platform support
 
-- **Linux** — glibc. Verified locally: 85 tests passing against a real Secret
+- **Linux** — glibc 2.35 or newer (the release binaries are built on Ubuntu
+  22.04). Verified locally: 85 tests passing against a real Secret
   Service (see "What's actually verified" above — CI itself has not run).
 - **macOS** — Intel and Apple Silicon. Implemented, never run.
 - **Windows** — x86_64. Implemented, never run.

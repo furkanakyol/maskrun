@@ -84,7 +84,11 @@ fn run_in(
 
 fn keyring_probe_available() -> bool {
     let probe = format!("maskrun-selftest-probe-{}", unique_suffix());
-    let put = run(&["put", &probe, "--stdin"], &[], Some(b"probe-value-long-enough"));
+    let put = run(
+        &["put", &probe, "--stdin"],
+        &[],
+        Some(b"probe-value-long-enough"),
+    );
     if !put.status.success() {
         return false;
     }
@@ -134,7 +138,10 @@ fn keyring_roundtrip_preserves_awkward_values() {
         return;
     }
     let cases: [(&str, String); 6] = [
-        ("url with = in query", "postgres://u:p@h:5432/db?opt=a=b&x=1".to_string()),
+        (
+            "url with = in query",
+            "postgres://u:p@h:5432/db?opt=a=b&x=1".to_string(),
+        ),
         ("double quoted", "value \"with\" quotes".to_string()),
         ("single quoted", "value 'with' quotes".to_string()),
         ("spaces", "a value with spaces".to_string()),
@@ -144,7 +151,11 @@ fn keyring_roundtrip_preserves_awkward_values() {
     for (label, value) in cases {
         let secret = store(value.as_bytes());
         let got = run(&["get", &secret.name], &[("MASKRUN_ALLOW_READ", "1")], None);
-        assert!(got.status.success(), "{label}: {}", String::from_utf8_lossy(&got.stderr));
+        assert!(
+            got.status.success(),
+            "{label}: {}",
+            String::from_utf8_lossy(&got.stderr)
+        );
         let returned = String::from_utf8_lossy(&got.stdout);
         let returned = returned.strip_suffix('\n').unwrap_or(&returned);
         assert_eq!(
@@ -175,7 +186,11 @@ fn keyring_rm_removes() {
         return;
     }
     let name = format!("maskrun-test-{}", unique_suffix());
-    let put = run(&["put", &name, "--stdin"], &[], Some(random_value().as_bytes()));
+    let put = run(
+        &["put", &name, "--stdin"],
+        &[],
+        Some(random_value().as_bytes()),
+    );
     assert!(put.status.success());
     let rm = run(&["rm", &name], &[], None);
     assert!(rm.status.success());
@@ -197,7 +212,10 @@ fn keyring_get_missing_fails() {
 fn invalid_name_rejected() {
     for bad in ["has space", "has/slash", "-leading-dash", ""] {
         let result = run(&["get", bad], &[("MASKRUN_ALLOW_READ", "1")], None);
-        assert!(!result.status.success(), "should have been rejected: {bad:?}");
+        assert!(
+            !result.status.success(),
+            "should have been rejected: {bad:?}"
+        );
     }
 }
 
@@ -209,15 +227,27 @@ fn status_reports_ok_and_missing() {
     let value = random_value();
     let secret = store(value.as_bytes());
     let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join(".maskrun"), format!("TEST={}\n", secret.name)).unwrap();
+    std::fs::write(
+        dir.path().join(".maskrun"),
+        format!("TEST={}\n", secret.name),
+    )
+    .unwrap();
 
     let ok = run_in(Some(dir.path()), &["status"], &[], None);
-    assert!(ok.status.success(), "{}", String::from_utf8_lossy(&ok.stderr));
+    assert!(
+        ok.status.success(),
+        "{}",
+        String::from_utf8_lossy(&ok.stderr)
+    );
     assert!(String::from_utf8_lossy(&ok.stdout).contains("ok"));
 
     std::fs::write(
         dir.path().join(".maskrun"),
-        format!("TEST={}\nOTHER=maskrun-absent-{}\n", secret.name, unique_suffix()),
+        format!(
+            "TEST={}\nOTHER=maskrun-absent-{}\n",
+            secret.name,
+            unique_suffix()
+        ),
     )
     .unwrap();
     let missing = run_in(Some(dir.path()), &["status"], &[], None);
@@ -252,7 +282,19 @@ fn double_dash_argv_split_reaches_real_command() {
     // `echo` sees it as a literal argument and prints it back.
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join(".maskrun"), "").unwrap();
-    let result = run_in(Some(dir.path()), &["run", "--", "echo", "hi", "--", "--flag"], &[], None);
-    assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
-    assert_eq!(String::from_utf8_lossy(&result.stdout).trim_end(), "hi -- --flag");
+    let result = run_in(
+        Some(dir.path()),
+        &["run", "--", "echo", "hi", "--", "--flag"],
+        &[],
+        None,
+    );
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&result.stdout).trim_end(),
+        "hi -- --flag"
+    );
 }
