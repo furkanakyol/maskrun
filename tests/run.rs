@@ -44,6 +44,35 @@ fn fingerprint(data: &[u8]) -> u64 {
     hash
 }
 
+// libtest gives each #[test] its own freshly spawned OS thread and joins it
+// before that slot picks up another test, so one store per thread is one
+// store per test: created lazily on first `run`/`run_in` call, removed when
+// the test's thread exits.
+struct IsolatedStore(std::path::PathBuf);
+
+impl Drop for IsolatedStore {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+thread_local! {
+    static ISOLATED_STORE: std::cell::RefCell<Option<IsolatedStore>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn isolated_store_dir() -> std::path::PathBuf {
+    ISOLATED_STORE.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        if slot.is_none() {
+            let dir = std::env::temp_dir().join(format!("maskrun-test-store-{}", unique_suffix()));
+            std::fs::create_dir_all(&dir).expect("failed to create isolated store dir");
+            *slot = Some(IsolatedStore(dir));
+        }
+        slot.as_ref().unwrap().0.clone()
+    })
+}
+
 fn run(args: &[&str], env_extra: &[(&str, &str)], stdin_data: Option<&[u8]>) -> Output {
     run_in(None, args, env_extra, stdin_data)
 }
@@ -68,12 +97,18 @@ fn run_in(
         "REPLIT_AGENT",
         "MASKRUN_MASK",
         "MASKRUN_ALLOW_READ",
+        "MASKRUN_BACKEND",
+        "MASKRUN_STORE_DIR",
     ] {
         cmd.env_remove(var);
     }
     // These tests assert agent-session behaviour (masking on by default, get
     // and import refused); individual tests override this via env_extra.
     cmd.env("MASKRUN_AGENT", "1");
+    // Isolated by default so this suite never reaches the real OS keyring;
+    // env_extra (applied after) can still override MASKRUN_BACKEND.
+    cmd.env("MASKRUN_BACKEND", "memory");
+    cmd.env("MASKRUN_STORE_DIR", isolated_store_dir());
     for (k, v) in env_extra {
         cmd.env(k, v);
     }
