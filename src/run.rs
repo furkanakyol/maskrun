@@ -70,18 +70,33 @@ fn collect(pairs: &[(String, String)], backend: &dyn Backend) -> Result<HashMap<
             _ => missing.push((var.clone(), secret.clone())),
         }
     }
-    if !missing.is_empty() {
-        let lines = missing
-            .iter()
-            .map(|(var, secret)| format!("    {var:<28} -> {secret}"))
-            .collect::<Vec<_>>()
-            .join("\n");
+    if missing.is_empty() {
+        return Ok(injected);
+    }
+
+    let lines = missing
+        .iter()
+        .map(|(var, secret)| format!("    {var:<28} -> {secret}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    // A locked keyring returns "not found" for everything in it, which looks
+    // exactly like an empty one from here — check before telling the user to
+    // `put` a secret that may already exist behind the lock, which would
+    // have them overwrite it instead of just unlocking.
+    if backend.is_locked().unwrap_or(false) {
         return Err(Error::msg(format!(
-            "refusing to run with a half-filled environment. Missing from the keyring:\n\
-             {lines}\nAdd them with: maskrun put <name>"
+            "the keyring appears to be locked, so maskrun cannot tell whether these secrets \
+             exist:\n{lines}\nUnlock it (log back in, or open your keyring/keychain manager) \
+             and try again. Do not `maskrun put` them again — a locked keyring is not the \
+             same as an empty one."
         )));
     }
-    Ok(injected)
+
+    Err(Error::msg(format!(
+        "refusing to run with a half-filled environment. Missing from the keyring:\n\
+         {lines}\nAdd them with: maskrun put <name>"
+    )))
 }
 
 #[cfg(unix)]
@@ -121,8 +136,10 @@ mod tests {
     use super::*;
     use crate::error::Error as MaskrunError;
 
+    #[derive(Default)]
     struct FakeBackend {
         values: HashMap<&'static str, &'static str>,
+        locked: bool,
     }
 
     impl Backend for FakeBackend {
@@ -141,11 +158,14 @@ mod tests {
         fn list(&self) -> Result<Vec<String>> {
             Ok(self.values.keys().map(|s| s.to_string()).collect())
         }
+        fn is_locked(&self) -> Result<bool> {
+            Ok(self.locked)
+        }
     }
 
     #[test]
     fn collect_refuses_half_filled_environment() {
-        let backend = FakeBackend { values: HashMap::from([("present", "value")]) };
+        let backend = FakeBackend { values: HashMap::from([("present", "value")]), ..Default::default() };
         let pairs = vec![
             ("A".to_string(), "present".to_string()),
             ("B".to_string(), "absent".to_string()),
@@ -156,8 +176,42 @@ mod tests {
     }
 
     #[test]
+    fn collect_reports_locked_keyring_instead_of_suggesting_put() {
+        let backend = FakeBackend {
+            values: HashMap::from([("present", "value")]),
+            locked: true,
+        };
+        let pairs = vec![
+            ("A".to_string(), "present".to_string()),
+            ("B".to_string(), "absent".to_string()),
+        ];
+        let err = collect(&pairs, &backend).unwrap_err().to_string();
+        assert!(err.contains("locked"), "{err}");
+        assert!(!err.contains("half-filled"), "{err}");
+        // The unlocked-and-missing message's actual suggestion; this one
+        // must not make it, even though it mentions `maskrun put` itself to
+        // tell the user not to.
+        assert!(!err.contains("Add them with"), "{err}");
+    }
+
+    #[test]
+    fn collect_ignores_lock_state_when_nothing_is_missing() {
+        // A locked keyring must not turn a fully successful run into an
+        // error just because is_locked() happens to report true (e.g. some
+        // unrelated collection is locked) — the lock check only kicks in
+        // once something has actually failed to resolve.
+        let backend = FakeBackend {
+            values: HashMap::from([("present", "value")]),
+            locked: true,
+        };
+        let pairs = vec![("A".to_string(), "present".to_string())];
+        let injected = collect(&pairs, &backend).unwrap();
+        assert_eq!(injected.get("A"), Some(&"value".to_string()));
+    }
+
+    #[test]
     fn collect_treats_empty_value_as_missing() {
-        let backend = FakeBackend { values: HashMap::from([("empty", "")]) };
+        let backend = FakeBackend { values: HashMap::from([("empty", "")]), ..Default::default() };
         let pairs = vec![("A".to_string(), "empty".to_string())];
         let err = collect(&pairs, &backend).unwrap_err();
         assert!(err.to_string().contains("half-filled"));
@@ -165,7 +219,7 @@ mod tests {
 
     #[test]
     fn collect_succeeds_when_everything_present() {
-        let backend = FakeBackend { values: HashMap::from([("present", "value")]) };
+        let backend = FakeBackend { values: HashMap::from([("present", "value")]), ..Default::default() };
         let pairs = vec![("A".to_string(), "present".to_string())];
         let injected = collect(&pairs, &backend).unwrap();
         assert_eq!(injected.get("A"), Some(&"value".to_string()));
@@ -173,7 +227,7 @@ mod tests {
 
     #[test]
     fn cmd_run_rejects_empty_command() {
-        let backend = FakeBackend { values: HashMap::new() };
+        let backend = FakeBackend { values: HashMap::new(), ..Default::default() };
         let err = cmd_run(&[], false, false, &backend).unwrap_err();
         assert!(matches!(err, MaskrunError::User(_)));
         assert!(err.to_string().contains("nothing to run"));
@@ -181,7 +235,7 @@ mod tests {
 
     #[test]
     fn cmd_exec_rejects_missing_assignment() {
-        let backend = FakeBackend { values: HashMap::new() };
+        let backend = FakeBackend { values: HashMap::new(), ..Default::default() };
         let err =
             cmd_exec(&[], &["echo".to_string()], false, false, &backend).unwrap_err();
         assert!(err.to_string().contains("no VAR=secret-name given"));
@@ -189,7 +243,7 @@ mod tests {
 
     #[test]
     fn cmd_exec_rejects_malformed_assignment() {
-        let backend = FakeBackend { values: HashMap::new() };
+        let backend = FakeBackend { values: HashMap::new(), ..Default::default() };
         let err = cmd_exec(
             &["not-an-assignment".to_string()],
             &["echo".to_string()],

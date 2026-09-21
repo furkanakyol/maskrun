@@ -10,6 +10,13 @@ pub trait Backend {
     fn get(&self, secret: &str) -> Result<Option<String>>;
     fn delete(&self, secret: &str) -> Result<()>;
     fn list(&self) -> Result<Vec<String>>;
+
+    // Locked looks identical to empty to get()/list() on Secret Service;
+    // default false since Keychain/Credential Manager expose no comparable
+    // queryable lock.
+    fn is_locked(&self) -> Result<bool> {
+        Ok(false)
+    }
 }
 
 // `^[A-Za-z0-9][A-Za-z0-9._-]*$`, written by hand instead of with `regex` —
@@ -188,6 +195,17 @@ pub mod linux {
             names.dedup();
             Ok(names)
         }
+
+        // put()/get()/list() don't pin to one collection, so there's no
+        // single one to ask; treating any locked collection as a hit errs
+        // toward warning over silently agreeing with "empty".
+        fn is_locked(&self) -> Result<bool> {
+            let collections = self
+                .ss
+                .get_all_collections()
+                .map_err(|e| Error::msg(format!("secret-service: {e}")))?;
+            Ok(collections.iter().any(|c| c.is_locked().unwrap_or(false)))
+        }
     }
 }
 
@@ -219,6 +237,8 @@ pub mod macos {
         }
     }
 
+    // Default is_locked() stands: security-framework surfaces a locked
+    // keychain as a get()/put() error, not a queryable property.
     impl Backend for KeychainBackend {
         fn name(&self) -> &'static str {
             "keychain"
@@ -312,6 +332,8 @@ pub mod windows {
         }
     }
 
+    // Default is_locked() stands: Credential Manager has no lock concept,
+    // only the logged-in user session.
     impl Backend for CredentialManagerBackend {
         fn name(&self) -> &'static str {
             "dpapi"
@@ -400,5 +422,22 @@ pub mod windows {
                 Ok(names)
             }
         }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    // Read-only, so safe against a real in-use keyring; skips (not fails)
+    // when none is reachable, same as the rest of the suite.
+    #[test]
+    fn is_locked_completes_against_a_real_backend_if_one_is_reachable() {
+        let Ok(backend) = linux::SecretServiceBackend::connect() else {
+            eprintln!("skipping: no reachable secret-service backend");
+            return;
+        };
+        let locked = backend.is_locked();
+        assert!(locked.is_ok(), "is_locked() should report a state, not error: {locked:?}");
     }
 }
