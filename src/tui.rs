@@ -68,7 +68,6 @@ pub fn run_overview() -> Result<i32> {
     run_interactive(backend.as_ref(), entries, &mut ArboardClipboard::new())
 }
 
-// ---------------------------------------------------------------------------
 // Clipboard abstraction: real runs talk to arboard, tests talk to an
 // in-memory fake, so the state machine's copy/clear/timeout logic never needs
 // a display server to exercise.
@@ -157,7 +156,6 @@ fn clear_clipboard_best_effort() {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Pure state: grouping, navigation, and the effects of every key. No I/O.
 
 struct Group {
@@ -296,29 +294,51 @@ impl App {
         self.confirm_delete = false;
     }
 
-    // Re-reads the keyring after a mutation (edit/delete) and keeps the
-    // cursor on the same secret when it still exists, instead of resetting
-    // to the top of the list every time.
-    fn refresh(&mut self, backend: &dyn Backend) -> Result<()> {
-        let previous = self.current().map(|(n, _)| n.clone());
+    fn reload(&mut self, backend: &dyn Backend) -> Result<()> {
         let mut entries = backend.list_meta()?;
         entries.sort_by(|a, b| a.0.cmp(&b.0));
         self.groups = group_entries(&entries);
         self.entries = entries;
         self.revealed = None;
+        Ok(())
+    }
 
-        if let Some(name) = previous {
+    // Finds `name` and puts the cursor on it; if absent (or `name` is
+    // `None`), clamps the group cursor and resets the row instead. Returns
+    // whether it actually found the secret.
+    fn select(&mut self, name: Option<&str>) -> bool {
+        if let Some(name) = name {
             for (gi, group) in self.groups.iter().enumerate() {
                 if let Some(ri) = group.rows.iter().position(|&i| self.entries[i].0 == name) {
                     self.sel_group = gi;
                     self.sel_row = ri;
-                    return Ok(());
+                    return true;
                 }
             }
         }
         self.sel_group = self.sel_group.min(self.groups.len().saturating_sub(1));
         self.sel_row = 0;
-        self.focus = Focus::Platforms;
+        false
+    }
+
+    // Re-reads the keyring after a mutation (edit/delete) and keeps the
+    // cursor on the same secret when it still exists, instead of resetting
+    // to the top of the list every time.
+    fn refresh(&mut self, backend: &dyn Backend) -> Result<()> {
+        let previous = self.current().map(|(n, _)| n.clone());
+        self.reload(backend)?;
+        if !self.select(previous.as_deref()) {
+            self.focus = Focus::Platforms;
+        }
+        Ok(())
+    }
+
+    // After adding a secret there's no "previous selection" to preserve —
+    // the one just written is what the user wants to see, highlighted.
+    fn refresh_selecting(&mut self, backend: &dyn Backend, name: &str) -> Result<()> {
+        self.reload(backend)?;
+        self.select(Some(name));
+        self.focus = Focus::Secrets;
         Ok(())
     }
 
@@ -450,7 +470,6 @@ fn handle_key(
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
 // Rendering: a pure `Vec<String>` frame, so content can be asserted on
 // without a terminal, plus a thin crossterm writer for the real run.
 
@@ -478,7 +497,8 @@ fn render(app: &App, cols: u16, rows: u16) -> Vec<String> {
         lines.push(" no secrets yet — run: maskrun put <name>".to_string());
     } else {
         let detail_height = 4; // separator + platform + note + value
-        let body_rows = rows.saturating_sub(lines.len() + 3 /* blank + hints + status */);
+        let body_rows =
+            rows.saturating_sub(lines.len() + 4 /* blank + hints + clip + status */);
         let list_height = body_rows.saturating_sub(detail_height).max(1);
 
         let mut left = Vec::new();
@@ -493,7 +513,10 @@ fn render(app: &App, cols: u16, rows: u16) -> Vec<String> {
             ));
         }
 
-        let mut right = Vec::new();
+        // Anchored at the selected group's own left-pane row: starting at
+        // row 0 printed the highlighted secret beside whatever unrelated
+        // group happened to sit at that absolute row on the left.
+        let mut right: Vec<String> = vec![String::new(); app.sel_group];
         if let Some(group) = app.groups.get(app.sel_group) {
             for (ri, &idx) in group.rows.iter().enumerate() {
                 let marker = if app.focus == Focus::Secrets && ri == app.sel_row {
@@ -531,35 +554,57 @@ fn render(app: &App, cols: u16, rows: u16) -> Vec<String> {
     }
 
     lines.push(String::new());
-    let mut hint =
-        " ↑↓ move   → enter   ← back   e edit   d delete   v reveal   y copy".to_string();
-    if app.clip.is_some() {
-        hint.push_str("   c clear");
-    }
-    hint.push_str("   q quit");
-    lines.push(hint);
-
-    let status_line = if app.confirm_delete {
-        let name = app.current().map(|(n, _)| n.as_str()).unwrap_or("?");
-        format!(" delete '{name}'? [y/N]")
-    } else if let Some(clip) = &app.clip {
-        let secs = clip.remaining().as_secs();
-        match &app.status {
-            Some(s) => format!(" {s} — clipboard clears in {secs}s"),
-            None => format!(" clipboard clears in {secs}s"),
-        }
-    } else {
-        match &app.status {
-            Some(s) => format!(" {s}"),
-            None => String::new(),
-        }
-    };
-    lines.push(status_line);
+    lines.push(hint_line(app, cols));
+    lines.push(clip_line(app));
+    lines.push(status_line(app));
 
     lines
         .into_iter()
         .map(|l| l.chars().take(cols).collect())
         .collect()
+}
+
+// The full labels when they fit; a bare-keys fallback otherwise, instead of
+// cutting the long form mid-word (e.g. "q quit" -> "q qu" at 84 columns
+// once "c clear" is in the mix).
+fn hint_line(app: &App, cols: usize) -> String {
+    let mut full =
+        " ↑↓ move   → enter   ← back   a add   e edit   d delete   v reveal   y copy".to_string();
+    if app.clip.is_some() {
+        full.push_str("   c clear");
+    }
+    full.push_str("   q quit");
+    if full.chars().count() <= cols {
+        return full;
+    }
+
+    let mut short = " ↑↓ → ← a e d v y".to_string();
+    if app.clip.is_some() {
+        short.push_str(" c");
+    }
+    short.push_str(" q");
+    short.chars().take(cols).collect()
+}
+
+fn clip_line(app: &App) -> String {
+    match &app.clip {
+        Some(clip) => format!(" clipboard clears in {}s", clip.remaining().as_secs()),
+        None => String::new(),
+    }
+}
+
+// Kept on its own line and apart from `clip_line`: a cancelled delete and an
+// active clipboard countdown used to share this line and get concatenated
+// into one confusing message.
+fn status_line(app: &App) -> String {
+    if app.confirm_delete {
+        let name = app.current().map(|(n, _)| n.as_str()).unwrap_or("?");
+        return format!(" delete '{name}'? [y/N]");
+    }
+    match &app.status {
+        Some(s) => format!(" {s}"),
+        None => String::new(),
+    }
 }
 
 fn pad_between(left: &str, right: &str, cols: usize) -> String {
@@ -573,6 +618,10 @@ fn pad_between(left: &str, right: &str, cols: usize) -> String {
 // showing below whatever this frame's own (shorter) content overwrites.
 fn draw(stdout: &mut impl Write, app: &App, cols: u16, rows: u16) -> Result<()> {
     let lines = render(app, cols, rows);
+    draw_lines(stdout, &lines, rows)
+}
+
+fn draw_lines(stdout: &mut impl Write, lines: &[String], rows: u16) -> Result<()> {
     queue!(stdout, Clear(ClearType::All), MoveTo(0, 0))?;
     for (i, line) in lines.iter().take(rows as usize).enumerate() {
         queue!(stdout, MoveTo(0, i as u16))?;
@@ -591,7 +640,6 @@ fn draw(stdout: &mut impl Write, app: &App, cols: u16, rows: u16) -> Result<()> 
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
 // Terminal lifecycle. `TerminalGuard::drop` covers a panic that unwinds
 // (debug/test builds); `install_panic_hook` covers `panic = "abort"`
 // (release, per Cargo.toml), which never unwinds and so never runs `drop` at
@@ -633,7 +681,6 @@ fn install_panic_hook() {
     }));
 }
 
-// ---------------------------------------------------------------------------
 // Cooked-mode detour for `e`: alternate screen stays up (nothing it prints
 // reaches scrollback either), only raw mode toggles off so `read_line` and
 // `rpassword` get normal line editing and their own echo handling.
@@ -715,8 +762,297 @@ fn prompt_new_value(secret: &str) -> Result<Option<Zeroizing<String>>> {
     Ok(Some(first))
 }
 
-// ---------------------------------------------------------------------------
-// Main loop.
+// Full-screen add-secret form. Runs its own small event loop, like
+// `run_interactive`'s minus the clipboard tick, instead of `edit_secret`'s
+// cooked-mode detour: alternate screen and raw mode stay up throughout, so
+// the value fields are masked by hand rather than through `rpassword`
+// (which needs a real cooked terminal to hide input).
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum AddField {
+    Name,
+    Platform,
+    Note,
+    Value,
+    Confirm,
+}
+
+impl AddField {
+    fn next(self) -> Self {
+        match self {
+            AddField::Name => AddField::Platform,
+            AddField::Platform => AddField::Note,
+            AddField::Note => AddField::Value,
+            AddField::Value => AddField::Confirm,
+            AddField::Confirm => AddField::Confirm,
+        }
+    }
+    fn prev(self) -> Self {
+        match self {
+            AddField::Name => AddField::Name,
+            AddField::Platform => AddField::Name,
+            AddField::Note => AddField::Platform,
+            AddField::Value => AddField::Note,
+            AddField::Confirm => AddField::Value,
+        }
+    }
+}
+
+struct AddForm {
+    field: AddField,
+    name: String,
+    platform: String,
+    note: String,
+    value: Zeroizing<String>,
+    confirm: Zeroizing<String>,
+    error: Option<String>,
+}
+
+impl AddForm {
+    fn new() -> Self {
+        AddForm {
+            field: AddField::Name,
+            name: String::new(),
+            platform: String::new(),
+            note: String::new(),
+            value: Zeroizing::new(String::new()),
+            confirm: Zeroizing::new(String::new()),
+            error: None,
+        }
+    }
+
+    fn push_char(&mut self, c: char) {
+        match self.field {
+            AddField::Name => self.name.push(c),
+            AddField::Platform => self.platform.push(c),
+            AddField::Note => self.note.push(c),
+            AddField::Value => self.value.push(c),
+            AddField::Confirm => self.confirm.push(c),
+        }
+    }
+
+    fn backspace(&mut self) {
+        match self.field {
+            AddField::Name => {
+                self.name.pop();
+            }
+            AddField::Platform => {
+                self.platform.pop();
+            }
+            AddField::Note => {
+                self.note.pop();
+            }
+            AddField::Value => {
+                self.value.pop();
+            }
+            AddField::Confirm => {
+                self.confirm.pop();
+            }
+        }
+    }
+
+    fn cycle_platform(&mut self, platforms: &[String], delta: i32) {
+        if self.field != AddField::Platform {
+            return;
+        }
+        let mut options = vec![String::new()];
+        options.extend(platforms.iter().cloned());
+        let current = options
+            .iter()
+            .position(|p| p == &self.platform)
+            .unwrap_or(0);
+        let next = clamp_move(current, delta, options.len() - 1);
+        self.platform = options[next].clone();
+    }
+
+    fn back(&mut self) {
+        self.error = None;
+        self.field = self.field.prev();
+    }
+
+    // Enter/Tab: validate the field being left and, only on success, move
+    // to the next one. Returns `true` once the confirm field matches the
+    // value field — the caller's cue to actually store the secret.
+    fn advance(&mut self, existing: &[(String, SecretMeta)]) -> bool {
+        self.error = None;
+        match self.field {
+            AddField::Name => {
+                if self.name.is_empty() {
+                    self.error = Some("name is required".into());
+                } else if let Err(e) = crate::keyring::check_name(&self.name) {
+                    self.error = Some(e.to_string());
+                } else if existing.iter().any(|(n, _)| n == &self.name) {
+                    self.error = Some(format!("{} already exists", self.name));
+                } else {
+                    self.field = self.field.next();
+                }
+            }
+            AddField::Platform => {
+                if self.platform.is_empty() {
+                    self.field = self.field.next();
+                } else if let Err(e) = crate::keyring::check_name(&self.platform) {
+                    self.error = Some(e.to_string());
+                } else {
+                    self.field = self.field.next();
+                }
+            }
+            AddField::Note => {
+                if self.note.is_empty() {
+                    self.field = self.field.next();
+                } else if let Err(e) = crate::keyring::check_note(&self.note) {
+                    self.error = Some(e.to_string());
+                } else {
+                    self.field = self.field.next();
+                }
+            }
+            AddField::Value => {
+                if self.value.is_empty() {
+                    self.error = Some("value is required".into());
+                } else {
+                    self.field = self.field.next();
+                }
+            }
+            AddField::Confirm => {
+                if *self.value == *self.confirm {
+                    return true;
+                }
+                self.error = Some("values did not match".into());
+                self.confirm = Zeroizing::new(String::new());
+            }
+        }
+        false
+    }
+}
+
+fn masked(value: &Zeroizing<String>) -> String {
+    "•".repeat(value.chars().count())
+}
+
+fn field_line(label: &str, value: &str, active: bool) -> String {
+    let marker = if active { "▸" } else { " " };
+    format!(" {marker} {:<10}{}", format!("{label}:"), value)
+}
+
+fn render_add_form(form: &AddForm, platforms: &[String], cols: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    lines.push(pad_between(" maskrun", "add secret", cols));
+    lines.push(String::new());
+
+    lines.push(field_line("name", &form.name, form.field == AddField::Name));
+    lines.push(field_line(
+        "platform",
+        &form.platform,
+        form.field == AddField::Platform,
+    ));
+    lines.push(if platforms.is_empty() {
+        String::new()
+    } else {
+        format!("   existing: {}", platforms.join(", "))
+    });
+    lines.push(field_line("note", &form.note, form.field == AddField::Note));
+    lines.push(field_line(
+        "value",
+        &masked(&form.value),
+        form.field == AddField::Value,
+    ));
+    lines.push(field_line(
+        "confirm",
+        &masked(&form.confirm),
+        form.field == AddField::Confirm,
+    ));
+
+    lines.push(String::new());
+    lines.push(match &form.error {
+        Some(e) => format!(" ! {e}"),
+        None => String::new(),
+    });
+    lines.push(" Enter/Tab next   Shift-Tab back   Esc cancel".to_string());
+
+    lines
+        .into_iter()
+        .map(|l| l.chars().take(cols).collect())
+        .collect()
+}
+
+fn draw_add_form(
+    stdout: &mut impl Write,
+    form: &AddForm,
+    platforms: &[String],
+    cols: u16,
+    rows: u16,
+) -> Result<()> {
+    let lines = render_add_form(form, platforms, cols as usize);
+    draw_lines(stdout, &lines, rows)
+}
+
+// Esc drops `form` — including its two `Zeroizing` value buffers — without
+// ever calling `backend.put`, so cancelling never leaves the typed value
+// sitting in memory or in the vault.
+fn run_add_form(app: &mut App, backend: &dyn Backend) -> Result<()> {
+    let mut platforms: Vec<String> = app
+        .entries
+        .iter()
+        .filter_map(|(_, m)| m.platform.clone())
+        .collect();
+    platforms.sort();
+    platforms.dedup();
+
+    let mut form = AddForm::new();
+    loop {
+        let (cols, rows) = size().unwrap_or((MIN_COLS, MIN_ROWS));
+        draw_add_form(&mut std::io::stdout(), &form, &platforms, cols, rows)?;
+
+        let Event::Key(KeyEvent {
+            code,
+            kind: KeyEventKind::Press,
+            modifiers,
+            ..
+        }) = event::read()?
+        else {
+            continue;
+        };
+
+        if modifiers.contains(KeyModifiers::CONTROL) && code == KeyCode::Char('c') {
+            return Ok(());
+        }
+
+        match code {
+            KeyCode::Esc => return Ok(()),
+            KeyCode::Up => form.cycle_platform(&platforms, -1),
+            KeyCode::Down => form.cycle_platform(&platforms, 1),
+            KeyCode::BackTab => form.back(),
+            KeyCode::Backspace => form.backspace(),
+            KeyCode::Tab | KeyCode::Enter => {
+                if form.advance(&app.entries) {
+                    let meta = MetaUpdate {
+                        platform: crate::platform_update(
+                            (!form.platform.is_empty()).then(|| form.platform.clone()),
+                        )?,
+                        note: crate::note_update(
+                            (!form.note.is_empty()).then(|| form.note.clone()),
+                        )?,
+                    };
+                    match backend.put(&form.name, &form.value, &meta) {
+                        Ok(()) => {
+                            let name = form.name.clone();
+                            app.refresh_selecting(backend, &name)?;
+                            app.status = Some(format!("added {name}"));
+                            return Ok(());
+                        }
+                        Err(e) => form.error = Some(format!("error: {e}")),
+                    }
+                }
+            }
+            KeyCode::Char(c)
+                if !modifiers.contains(KeyModifiers::CONTROL)
+                    && !modifiers.contains(KeyModifiers::ALT) =>
+            {
+                form.push_char(c)
+            }
+            _ => {}
+        }
+    }
+}
 
 fn run_interactive(
     backend: &dyn Backend,
@@ -758,6 +1094,9 @@ fn run_interactive(
                         app.quit = true;
                     } else if code == KeyCode::Char('e') && !app.confirm_delete {
                         edit_secret(&mut app, backend)?;
+                    } else if code == KeyCode::Char('a') && !app.confirm_delete {
+                        app.clear_transients();
+                        run_add_form(&mut app, backend)?;
                     } else {
                         handle_key(&mut app, code, backend, clip)?;
                     }
@@ -1282,5 +1621,149 @@ mod tests {
         };
         assert_eq!(state.remaining(), Duration::ZERO);
         assert!(state.expired());
+    }
+
+    #[test]
+    fn secret_marker_lines_up_with_its_own_platform_row() {
+        let mut app = App::new(sample_entries());
+        app.move_platform(1); // github -> vercel
+        app.enter();
+        let lines = render(&app, 80, 20);
+        let platform_row = lines.iter().position(|l| l.contains("vercel")).unwrap();
+        let secret_row = lines.iter().position(|l| l.contains("▸ vercel-x")).unwrap();
+        assert_eq!(
+            platform_row, secret_row,
+            "the selected secret should print beside its own platform, not row 0"
+        );
+    }
+
+    #[test]
+    fn cancel_message_and_clipboard_countdown_stay_on_separate_lines() {
+        let backend = MockBackend::with(&[("gh-a", "v1", Some("github"), None)]);
+        let mut app = App::new(sample_entries());
+        let mut clip = FakeClipboard::reachable();
+        app.copy(&backend, &mut clip);
+        handle_key(&mut app, KeyCode::Char('d'), &backend, &mut clip).unwrap();
+        handle_key(&mut app, KeyCode::Esc, &backend, &mut clip).unwrap();
+        assert_eq!(app.status.as_deref(), Some("cancelled"));
+
+        let lines = render(&app, 80, 20);
+        let status = lines.last().unwrap();
+        assert_eq!(status, " cancelled");
+        assert!(!status.contains("clipboard"));
+        assert!(lines.iter().any(|l| l.contains("clipboard clears in")));
+    }
+
+    #[test]
+    fn hint_never_truncates_a_word_when_the_terminal_is_narrow() {
+        let mut app = App::new(sample_entries());
+        app.clip = Some(ClipState {
+            started: Instant::now(),
+            previous: None,
+        });
+        let hint = hint_line(&app, 84);
+        assert!(hint.chars().count() <= 84);
+        assert!(hint.ends_with('q') || hint.ends_with("quit"));
+    }
+
+    #[test]
+    fn hint_shows_the_full_form_when_it_fits() {
+        let app = App::new(sample_entries());
+        let hint = hint_line(&app, 200);
+        assert!(hint.contains("q quit"));
+        assert!(hint.contains("a add"));
+    }
+
+    #[test]
+    fn add_form_walks_through_fields_on_valid_input() {
+        let existing = sample_entries();
+        let mut form = AddForm::new();
+        form.name = "new-secret".into();
+        assert!(!form.advance(&existing));
+        assert_eq!(form.field, AddField::Platform);
+        assert!(!form.advance(&existing));
+        assert_eq!(form.field, AddField::Note);
+        assert!(!form.advance(&existing));
+        assert_eq!(form.field, AddField::Value);
+        form.value = Zeroizing::new("s3cr3t".into());
+        assert!(!form.advance(&existing));
+        assert_eq!(form.field, AddField::Confirm);
+        form.confirm = Zeroizing::new("s3cr3t".into());
+        assert!(form.advance(&existing));
+    }
+
+    #[test]
+    fn add_form_blocks_on_empty_name() {
+        let mut form = AddForm::new();
+        assert!(!form.advance(&sample_entries()));
+        assert_eq!(form.field, AddField::Name);
+        assert_eq!(form.error.as_deref(), Some("name is required"));
+    }
+
+    #[test]
+    fn add_form_blocks_on_invalid_name_charset() {
+        let mut form = AddForm::new();
+        form.name = "has space".into();
+        assert!(!form.advance(&sample_entries()));
+        assert_eq!(form.field, AddField::Name);
+        assert!(form.error.is_some());
+    }
+
+    #[test]
+    fn add_form_blocks_on_duplicate_name() {
+        let mut form = AddForm::new();
+        form.name = "gh-a".into();
+        assert!(!form.advance(&sample_entries()));
+        assert_eq!(form.field, AddField::Name);
+        assert_eq!(form.error.as_deref(), Some("gh-a already exists"));
+    }
+
+    #[test]
+    fn add_form_rejects_mismatched_confirmation_without_cancelling() {
+        let mut form = AddForm::new();
+        form.field = AddField::Confirm;
+        form.value = Zeroizing::new("one".into());
+        form.confirm = Zeroizing::new("two".into());
+        assert!(!form.advance(&sample_entries()));
+        assert_eq!(form.field, AddField::Confirm);
+        assert_eq!(form.error.as_deref(), Some("values did not match"));
+        assert!(form.confirm.is_empty());
+    }
+
+    #[test]
+    fn add_form_platform_cycle_includes_blank_and_does_not_wrap() {
+        let mut form = AddForm::new();
+        form.field = AddField::Platform;
+        let platforms = vec!["github".to_string(), "vercel".to_string()];
+        form.cycle_platform(&platforms, -1);
+        assert_eq!(form.platform, "");
+        form.cycle_platform(&platforms, 1);
+        assert_eq!(form.platform, "github");
+        form.cycle_platform(&platforms, 1);
+        assert_eq!(form.platform, "vercel");
+        form.cycle_platform(&platforms, 1);
+        assert_eq!(form.platform, "vercel");
+    }
+
+    #[test]
+    fn add_form_back_returns_to_the_previous_field_and_clears_the_error() {
+        let mut form = AddForm::new();
+        form.field = AddField::Note;
+        form.error = Some("stale".into());
+        form.back();
+        assert_eq!(form.field, AddField::Platform);
+        assert!(form.error.is_none());
+    }
+
+    #[test]
+    fn render_add_form_masks_the_value_fields() {
+        let mut form = AddForm::new();
+        form.name = "gh-c".into();
+        form.value = Zeroizing::new("topsecretvalue".into());
+        form.confirm = Zeroizing::new("top".into());
+        let lines = render_add_form(&form, &[], 80).join("\n");
+        assert!(!lines.contains("topsecretvalue"));
+        assert!(!lines.contains("top"));
+        assert!(lines.contains("••••••••••••••"));
     }
 }
