@@ -40,6 +40,14 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      # Only the native Linux build needs these on the runner; cross supplies
+      # them inside its own image, and macOS/Windows do not use libdbus.
+      - name: Install libdbus headers
+        if: ${{ startsWith(matrix.os, 'ubuntu') && !matrix.cross }}
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libdbus-1-dev pkg-config
+
       - name: Install cross
         if: matrix.cross
         run: cargo install cross --locked

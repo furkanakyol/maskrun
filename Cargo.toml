@@ -2,7 +2,7 @@
 name = "maskrun"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.75"
+rust-version = "1.85"
 description = "Run commands with secrets from your OS keyring, without leaking them into an AI agent's context."
 license = "MIT"
 default-run = "maskrun"

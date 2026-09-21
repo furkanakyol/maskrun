@@ -403,7 +403,8 @@ pub mod windows {
     use ::windows::Win32::Foundation::{ERROR_NOT_FOUND, FILETIME};
     use ::windows::Win32::Security::Credentials::{
         CredDeleteW, CredEnumerateW, CredFree, CredReadW, CredWriteW, CREDENTIALW,
-        CRED_ENUMERATE_ALL_CREDENTIALS, CRED_PERSIST_LOCAL_MACHINE, CRED_TYPE_GENERIC,
+        CRED_ENUMERATE_ALL_CREDENTIALS, CRED_FLAGS, CRED_PERSIST_LOCAL_MACHINE,
+        CRED_TYPE_GENERIC,
     };
 
     fn target_name(secret: &str) -> Vec<u16> {
@@ -440,7 +441,7 @@ pub mod windows {
             let mut username = wide(SERVICE);
             let mut blob = value.as_bytes().to_vec();
             let credential = CREDENTIALW {
-                Flags: 0,
+                Flags: CRED_FLAGS(0),
                 Type: CRED_TYPE_GENERIC,
                 TargetName: PWSTR(target.as_mut_ptr()),
                 Comment: PWSTR::null(),
@@ -502,7 +503,7 @@ pub mod windows {
                 let mut ptr: *mut *mut CREDENTIALW = std::ptr::null_mut();
                 CredEnumerateW(
                     PWSTR(filter.as_ptr() as *mut _),
-                    CRED_ENUMERATE_ALL_CREDENTIALS.0,
+                    Some(CRED_ENUMERATE_ALL_CREDENTIALS),
                     &mut count,
                     &mut ptr,
                 )

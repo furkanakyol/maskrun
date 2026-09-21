@@ -20,7 +20,8 @@ jobs:
       - name: Install Secret Service
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq libsecret-tools gnome-keyring dbus-x11
+          sudo apt-get install -y -qq libsecret-tools gnome-keyring dbus-x11 \
+            libdbus-1-dev pkg-config
 
       - name: Build
         run: cargo build --release
@@ -91,6 +92,13 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
 
+      # libdbus-1-dev is a build dependency of libdbus-sys, not a running
+      # service: installing it does not give this job a keyring.
+      - name: Install libdbus headers
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libdbus-1-dev pkg-config
+
       - name: Build
         run: cargo build --release
 
@@ -117,6 +125,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+
+      # libdbus-1-dev is a build dependency of libdbus-sys, not a running
+      # service: installing it does not give this job a keyring.
+      - name: Install libdbus headers
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libdbus-1-dev pkg-config
 
       - name: cargo fmt --check
         run: cargo fmt --check
@@ -154,5 +169,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ steps.msrv.outputs.version }}
+
+      # libdbus-1-dev is a build dependency of libdbus-sys, not a running
+      # service: installing it does not give this job a keyring.
+      - name: Install libdbus headers
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libdbus-1-dev pkg-config
+
       - name: Build at MSRV
         run: cargo build --locked
