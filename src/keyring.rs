@@ -399,7 +399,7 @@ pub mod macos {
 #[cfg(target_os = "windows")]
 pub mod windows {
     use super::*;
-    use ::windows::core::PWSTR;
+    use ::windows::core::{HRESULT, PWSTR};
     use ::windows::Win32::Foundation::{ERROR_NOT_FOUND, FILETIME};
     use ::windows::Win32::Security::Credentials::{
         CredDeleteW, CredEnumerateW, CredFree, CredReadW, CredWriteW, CREDENTIALW,
@@ -477,7 +477,7 @@ pub mod windows {
                         CredFree(ptr as *mut _);
                         Ok(Some(value))
                     }
-                    Err(e) if e.code().0 as u32 == ERROR_NOT_FOUND.0 => Ok(None),
+                    Err(e) if e.code() == HRESULT::from_win32(ERROR_NOT_FOUND.0) => Ok(None),
                     Err(e) => Err(Error::msg(format!("credential manager: {e}"))),
                 }
             }
@@ -487,7 +487,7 @@ pub mod windows {
             let target = target_name(secret);
             unsafe { CredDeleteW(PWSTR(target.as_ptr() as *mut _), CRED_TYPE_GENERIC, None) }
                 .or_else(|e| {
-                    if e.code().0 as u32 == ERROR_NOT_FOUND.0 {
+                    if e.code() == HRESULT::from_win32(ERROR_NOT_FOUND.0) {
                         Ok(())
                     } else {
                         Err(Error::msg(format!("credential manager: {e}")))
@@ -509,7 +509,9 @@ pub mod windows {
                     Ok(()) => {}
                     // An empty store, or nothing matching the filter, comes
                     // back as ERROR_NOT_FOUND rather than a zero count.
-                    Err(e) if e.code().0 as u32 == ERROR_NOT_FOUND.0 => return Ok(Vec::new()),
+                    Err(e) if e.code() == HRESULT::from_win32(ERROR_NOT_FOUND.0) => {
+                        return Ok(Vec::new())
+                    }
                     Err(e) => return Err(Error::msg(format!("credential manager: {e}"))),
                 }
                 let mut names = Vec::new();

@@ -125,6 +125,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+          targets: x86_64-pc-windows-msvc, aarch64-apple-darwin
 
       # libdbus-1-dev is a build dependency of libdbus-sys, not a running
       # service: installing it does not give this job a keyring.
@@ -138,6 +139,15 @@ jobs:
 
       - name: cargo clippy
         run: cargo clippy --all-targets -- -D warnings
+
+      # The per-platform keyring backends are cfg-gated, so a Linux build
+      # never type-checks them. Checking the other two targets here catches
+      # a mistyped Win32 or Security.framework call in seconds instead of
+      # waiting on the platform runners.
+      - name: Type-check the other platforms
+        run: |
+          cargo check --target x86_64-pc-windows-msvc --all-targets
+          cargo check --target aarch64-apple-darwin --all-targets
 
       - name: Shell lint
         run: |
