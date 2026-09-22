@@ -6,6 +6,11 @@ rust-version = "1.85"
 description = "Run commands with secrets from your OS keyring, without leaking them into an AI agent's context."
 license = "GPL-3.0-or-later"
 default-run = "maskrun"
+repository = "https://github.com/furkanakyol/maskrun"
+readme = "README.md"
+keywords = ["secrets", "keyring", "ai-agent", "claude-code", "dotenv"]
+categories = ["command-line-utilities", "development-tools", "authentication"]
+exclude = [".github/", "tests/", "integrations/", "README.*.md", "install.sh", "install.ps1", "Makefile"]
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
@@ -56,3 +61,5 @@ lto = true
 opt-level = "z"
 codegen-units = 1
 panic = "abort"
+
+
