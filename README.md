@@ -1,3 +1,5 @@
+**English** · [简体中文](README.zh-CN.md) · [Español](README.es.md) · [Português (BR)](README.pt-BR.md) · [Русский](README.ru.md) · [日本語](README.ja.md) · [Français](README.fr.md) · [Deutsch](README.de.md) · [Türkçe](README.tr.md)
+
 # maskrun
 
 Run commands with secrets from your OS keyring — and keep the values out of
@@ -181,6 +183,8 @@ place instead of duplicating it), and `--remove` takes it back out without
 touching the rest of the file. With a `.maskrun` manifest present, the block
 lists the actual variable names the project expects; `--file <path>` targets
 one file directly, skipping discovery.
+
+<a id="interactive-view"></a>
 
 ### The interactive view
 
@@ -409,7 +413,7 @@ stored unmasked, are visible to an AI agent session, and are shown by `list`
 and `status`. Do not put a secret value in `--note`; it is capped at 200
 characters and may not contain a newline.
 
-`maskrun` with no arguments opens [the interactive view](#the-interactive-view)
+`maskrun` with no arguments opens [the interactive view](#interactive-view)
 in a real terminal; piped (`maskrun | cat`), non-interactive, or in an agent
 session, it prints a short overview instead: the manifest status and the
 grouped secret list above, so you don't have to hold the command surface in
